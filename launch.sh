@@ -218,7 +218,40 @@ sync_directories() {
     VERSIONS_DIR="$MC_DIR/versions"
     LIBS_DIR="$MC_DIR/libraries"
     ASSETS_DIR="$MC_DIR/assets"
-    mkdir -p "$VERSIONS_DIR" "$LIBS_DIR" "$ASSETS_DIR/indexes" "$ASSETS_DIR/objects" "$SKINS_DIR" "$CAPES_DIR" "$CLI_DIR/tools" "$CLI_DIR/versions"
+    mkdir -p "$VERSIONS_DIR" "$LIBS_DIR" "$ASSETS_DIR/indexes" "$ASSETS_DIR/objects" "$SKINS_DIR" "$CAPES_DIR" "$CLI_DIR/tools" "$CLI_DIR/versions" "$MC_DIR/.base_versions"
+
+    # Auto-migrate any unmanaged base versions (e.g. 1.21, 26.2) to $MC_DIR/.base_versions/
+    # if a mod loader inherits from them and the vanilla folder has no user saves or mods
+    if [ -d "$VERSIONS_DIR" ]; then
+        for v_dir in "$VERSIONS_DIR"/*; do
+            if [ -d "$v_dir" ] && [ ! -f "$v_dir/.explicit" ]; then
+                local v_name
+                v_name=$(basename "$v_dir")
+                local v_json="$v_dir/$v_name.json"
+                if [ -f "$v_json" ] && [ -z "$(jq -r '.inheritsFrom // empty' "$v_json" 2>/dev/null)" ]; then
+                    local is_dep=false
+                    for other_v in "$VERSIONS_DIR"/*; do
+                        local other_json="$other_v/$(basename "$other_v").json"
+                        if [ -f "$other_json" ] && [ "$(jq -r '.inheritsFrom // empty' "$other_json" 2>/dev/null)" == "$v_name" ]; then
+                            is_dep=true
+                            break
+                        fi
+                    done
+                    if [ "$is_dep" = true ]; then
+                        local mod_count
+                        mod_count=$(find "$v_dir/mods" -name "*.jar" 2>/dev/null | wc -l)
+                        local save_count
+                        save_count=$(find "$v_dir/saves" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+                        if [ "$mod_count" -eq 0 ] && [ "$save_count" -eq 0 ]; then
+                            mkdir -p "$MC_DIR/.base_versions/$v_name"
+                            mv "$v_dir"/* "$MC_DIR/.base_versions/$v_name/" 2>/dev/null || true
+                            rm -rf "$v_dir"
+                        fi
+                    fi
+                fi
+            fi
+        done
+    fi
 
     # Ensure every installed version folder has its own mods, resourcepacks, and shaderpacks directory inside it
     # Also expose shortcuts in ~/minecraft-cli/versions/<version_name>/
@@ -253,15 +286,13 @@ sync_directories() {
         done
     fi
 
-    local first_ver=""
-    if [ -d "$VERSIONS_DIR" ]; then
-        first_ver=$(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort | head -n 1)
-    fi
-    if [ -n "$first_ver" ] && [ -d "$VERSIONS_DIR/$first_ver" ]; then
-        ln -sfn "$VERSIONS_DIR/$first_ver/mods" "$CLI_DIR/mods"
-        ln -sfn "$VERSIONS_DIR/$first_ver/resourcepacks" "$CLI_DIR/resourcepacks"
-        ln -sfn "$VERSIONS_DIR/$first_ver/shaderpacks" "$CLI_DIR/shaderpacks"
-    fi
+    # Clean up any legacy root mods, resourcepacks, and shaderpacks symlinks/folders
+    [ -L "$CLI_DIR/mods" ] && rm -f "$CLI_DIR/mods"
+    [ -L "$CLI_DIR/resourcepacks" ] && rm -f "$CLI_DIR/resourcepacks"
+    [ -L "$CLI_DIR/shaderpacks" ] && rm -f "$CLI_DIR/shaderpacks"
+    [ -d "$CLI_DIR/mods" ] && [ ! -L "$CLI_DIR/mods" ] && [ -z "$(ls -A "$CLI_DIR/mods" 2>/dev/null)" ] && rmdir "$CLI_DIR/mods"
+    [ -d "$CLI_DIR/resourcepacks" ] && [ ! -L "$CLI_DIR/resourcepacks" ] && [ -z "$(ls -A "$CLI_DIR/resourcepacks" 2>/dev/null)" ] && rmdir "$CLI_DIR/resourcepacks"
+    [ -d "$CLI_DIR/shaderpacks" ] && [ ! -L "$CLI_DIR/shaderpacks" ] && [ -z "$(ls -A "$CLI_DIR/shaderpacks" 2>/dev/null)" ] && rmdir "$CLI_DIR/shaderpacks"
 }
 sync_directories
 
@@ -270,6 +301,7 @@ sync_directories
 # ==========================================
 download_vanilla_version() {
     local target_ver="$1"
+    local custom_dest_dir="$2"
     if [ -z "$target_ver" ]; then return 1; fi
 
     echo -e "\e[1;34m==> Fetching Mojang version manifest...\e[0m"
@@ -287,7 +319,7 @@ download_vanilla_version() {
         return 1
     fi
 
-    local target_ver_dir="$VERSIONS_DIR/$target_ver"
+    local target_ver_dir="${custom_dest_dir:-$VERSIONS_DIR/$target_ver}"
     mkdir -p "$target_ver_dir" "$target_ver_dir/natives"
 
     echo -e "\n\e[1;34m==> [1/4] Downloading version metadata ($target_ver.json)...\e[0m"
@@ -383,17 +415,23 @@ download_vanilla_version() {
         echo -e "  \e[1;32mAll assets are already verified and up-to-date.\e[0m"
     fi
 
+    [ -z "$custom_dest_dir" ] && touch "$target_ver_dir/.explicit"
     echo -e "\n\e[1;32m[+] Version $target_ver installed successfully in $target_ver_dir!\e[0m"
     return 0
 }
 
 ensure_vanilla_installed() {
     local mc_ver="$1"
-    if [ ! -f "$VERSIONS_DIR/$mc_ver/$mc_ver.json" ] || [ ! -f "$VERSIONS_DIR/$mc_ver/$mc_ver.jar" ]; then
-        echo -e "\n\e[1;33m[*] Base Minecraft $mc_ver is required and not installed yet.\e[0m"
-        echo -e "\e[1;34m==> Downloading and preparing base Minecraft $mc_ver first...\e[0m"
-        download_vanilla_version "$mc_ver" || return 1
+    if [ -f "$VERSIONS_DIR/$mc_ver/$mc_ver.json" ] && [ -f "$VERSIONS_DIR/$mc_ver/$mc_ver.jar" ]; then
+        return 0
     fi
+    local base_target="$MC_DIR/.base_versions/$mc_ver"
+    if [ -f "$base_target/$mc_ver.json" ] && [ -f "$base_target/$mc_ver.jar" ]; then
+        return 0
+    fi
+
+    echo -e "\n\e[1;33m[*] Downloading Minecraft $mc_ver base files in background...\e[0m"
+    download_vanilla_version "$mc_ver" "$base_target" || return 1
     return 0
 }
 
@@ -480,29 +518,27 @@ install_fabric_version() {
     echo -e "\e[1;36m             FABRIC LOADER INSTALLER          \e[0m"
     echo -e "\e[1;35m==============================================\e[0m"
 
-    mapfile -t VANILLA_INSTALLED < <(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | grep -E '^[0-9]+\.[0-9]+(\.[0-9]+)?$' | sort -V)
+    echo -e "\e[1;33mPopular Minecraft Versions for Fabric:\e[0m"
+    echo -e "  \e[1;32m[1]\e[0m 1.21.1"
+    echo -e "  \e[1;32m[2]\e[0m 1.21"
+    echo -e "  \e[1;32m[3]\e[0m 1.20.4"
+    echo -e "  \e[1;32m[4]\e[0m 1.20.1"
+    echo -e "  \e[1;32m[5]\e[0m 1.16.5"
+    echo -e "  \e[1;33m[c]\e[0m Custom Minecraft Version (e.g. 26.2, 1.21.11, etc.)"
+    echo -e "  \e[1;31m[b]\e[0m Back"
+    echo -e "\e[1;35m----------------------------------------------\e[0m"
+    read -rp "Select option: " f_opt
 
-    if [ ${#VANILLA_INSTALLED[@]} -gt 0 ]; then
-        echo -e "\e[1;33mDetected Installed Minecraft Versions:\e[0m"
-        for i in "${!VANILLA_INSTALLED[@]}"; do
-            printf "  \e[1;32m[%d]\e[0m %s\n" "$((i+1))" "${VANILLA_INSTALLED[$i]}"
-        done
-        echo -e "  \e[1;33m[c]\e[0m Type a different Minecraft version (e.g. 1.21.1, 1.20.4)"
-        echo -e "  \e[1;31m[b]\e[0m Back"
-        echo -e "\e[1;35m----------------------------------------------\e[0m"
-        read -rp "Select option: " f_opt
-
-        local target_mc=""
-        if [[ "$f_opt" =~ ^[0-9]+$ ]] && [ "$f_opt" -ge 1 ] && [ "$f_opt" -le "${#VANILLA_INSTALLED[@]}" ]; then
-            target_mc="${VANILLA_INSTALLED[$((f_opt-1))]}"
-        elif [ "$f_opt" == "c" ] || [ "$f_opt" == "C" ]; then
-            read -rp "Enter exact Minecraft version (e.g. 1.21.1): " target_mc
-        else
-            return
-        fi
-    else
-        read -rp "Enter Minecraft version for Fabric (e.g. 1.21.1, 1.20.4): " target_mc
-    fi
+    local target_mc=""
+    case "$f_opt" in
+        1) target_mc="1.21.1" ;;
+        2) target_mc="1.21" ;;
+        3) target_mc="1.20.4" ;;
+        4) target_mc="1.20.1" ;;
+        5) target_mc="1.16.5" ;;
+        c|C) read -rp "Enter exact Minecraft version: " target_mc ;;
+        *) return ;;
+    esac
 
     if [ -z "$target_mc" ]; then return; fi
 
@@ -706,6 +742,38 @@ install_quilt_version() {
     read -rp "Press Enter to return..."
 }
 
+delete_installed_version() {
+    clear
+    echo -e "\e[1;35m==============================================\e[0m"
+    echo -e "\e[1;36m           DELETE AN INSTALLED VERSION        \e[0m"
+    echo -e "\e[1;35m==============================================\e[0m"
+
+    mapfile -t ALL_VERS < <(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort)
+    if [ ${#ALL_VERS[@]} -eq 0 ]; then
+        echo -e "  \e[1;33mNo versions installed to delete.\e[0m\n"
+        read -rp "Press Enter to return..."
+        return
+    fi
+
+    for i in "${!ALL_VERS[@]}"; do
+        printf "  \e[1;32m[%d]\e[0m %s\n" "$((i+1))" "${ALL_VERS[$i]}"
+    done
+    echo -e "  \e[1;31m[b]\e[0m Back"
+    echo -e "\e[1;35m----------------------------------------------\e[0m"
+    read -rp "Select version number to delete: " del_opt
+
+    if [[ "$del_opt" =~ ^[0-9]+$ ]] && [ "$del_opt" -ge 1 ] && [ "$del_opt" -le "${#ALL_VERS[@]}" ]; then
+        local del_name="${ALL_VERS[$((del_opt-1))]}"
+        read -rp "Are you sure you want to delete '$del_name'? [y/N]: " confirm_del
+        if [[ "$confirm_del" =~ ^[yY]$ ]]; then
+            rm -rf "$VERSIONS_DIR/$del_name"
+            rm -rf "$CLI_DIR/versions/$del_name"
+            echo -e "\e[1;32m[+] Successfully deleted $del_name.\e[0m"
+            sleep 1
+        fi
+    fi
+}
+
 install_new_version() {
     while true; do
         clear
@@ -721,6 +789,7 @@ install_new_version() {
         echo -e "  \e[1;33m[5]\e[0m Minecraft Forge (Classic mod loader)"
         echo -e "  \e[1;35m[6]\e[0m Quilt Loader (Modern modular mod loader)"
         echo -e "  \e[1;37m[c]\e[0m Custom Mojang Version ID"
+        echo -e "  \e[1;31m[d]\e[0m Delete an Installed Version"
         echo -e "  \e[1;31m[b]\e[0m Back to Main Menu"
         echo -e "\e[1;35m----------------------------------------------\e[0m"
         read -rp "Select installer option: " i_choice
@@ -735,6 +804,9 @@ install_new_version() {
             c|C)
                 read -rp "Enter exact Mojang version ID: " cust_id
                 [ -n "$cust_id" ] && download_vanilla_version "$cust_id" && read -rp "Press Enter to return..."
+                ;;
+            d|D)
+                delete_installed_version
                 ;;
             b|B) break ;;
         esac
@@ -1158,9 +1230,6 @@ manage_mods_and_packs() {
             local cli_ver_dir="$CLI_DIR/versions/$target_ver"
 
             mkdir -p "$target_mods" "$target_rp" "$target_sp"
-            ln -sfn "$target_mods" "$CLI_DIR/mods"
-            ln -sfn "$target_rp" "$CLI_DIR/resourcepacks"
-            ln -sfn "$target_sp" "$CLI_DIR/shaderpacks"
 
             echo -e "\n\e[1;34m==> Version: $target_ver\e[0m"
             echo -e "Version Shortcuts : \e[1;32m$cli_ver_dir\e[0m"
@@ -1212,7 +1281,6 @@ while true; do
     echo -e "\e[1;35m==============================================\e[0m"
     printf "  \e[1;37mGame Path:\e[0m      \e[1;32m%s\e[0m\n" "$MC_DIR"
     printf "  \e[1;37mVersions Dir:\e[0m   \e[1;32m%s\e[0m\n" "$CLI_DIR/versions"
-    printf "  \e[1;37mActive Mods:\e[0m    \e[1;32m%s\e[0m\n" "$CLI_DIR/mods"
     printf "  \e[1;37mRAM:\e[0m            -Xms\e[1;32m%s\e[0m / -Xmx\e[1;32m%s\e[0m\n" "$MIN_RAM" "$MAX_RAM"
     echo -e "\e[1;35m----------------------------------------------\e[0m"
 
@@ -1249,7 +1317,7 @@ while true; do
     echo -e "  \e[1;33m[u]\e[0m Manage Accounts (Authlib / Offline)"
     echo -e "  \e[1;31m[q]\e[0m Quit"
     echo -e "\e[1;35m----------------------------------------------\e[0m"
-    read -rp "Select version number to launch or tool option: " main_choice
+    read -rp "Select version number to launch or tool option: " main_choice || exit 0
 
     case "$main_choice" in
         i|I)
@@ -1376,10 +1444,6 @@ INHERITS_FROM=$(jq -r '.inheritsFrom // empty' "$VERSION_JSON")
 ACTIVE_GAMEDIR="$VERSIONS_DIR/$SELECTED_VERSION"
 mkdir -p "$ACTIVE_GAMEDIR/mods" "$ACTIVE_GAMEDIR/resourcepacks" "$ACTIVE_GAMEDIR/shaderpacks" "$ACTIVE_GAMEDIR/saves" "$ACTIVE_GAMEDIR/config"
 
-# Update unhidden top-level symlinks in $CLI_DIR for easy access
-ln -sfn "$ACTIVE_GAMEDIR/mods" "$CLI_DIR/mods"
-ln -sfn "$ACTIVE_GAMEDIR/resourcepacks" "$CLI_DIR/resourcepacks"
-ln -sfn "$ACTIVE_GAMEDIR/shaderpacks" "$CLI_DIR/shaderpacks"
 
 # Copy existing saves if version saves folder is brand new
 if [ -d "$MC_DIR/saves" ] && [ -z "$(ls -A "$ACTIVE_GAMEDIR/saves" 2>/dev/null)" ]; then
@@ -1425,11 +1489,20 @@ for lib_raw in "${VERSION_LIBS[@]}"; do
     resolve_lib "$l_name" "$l_path" "$l_url"
 done
 
-if [ -n "$INHERITS_FROM" ] && [ -f "$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.json" ]; then
-    BASE_JSON="$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.json"
+BASE_DIR=""
+if [ -n "$INHERITS_FROM" ]; then
+    if [ -f "$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.json" ]; then
+        BASE_DIR="$VERSIONS_DIR/$INHERITS_FROM"
+    elif [ -f "$MC_DIR/.base_versions/$INHERITS_FROM/$INHERITS_FROM.json" ]; then
+        BASE_DIR="$MC_DIR/.base_versions/$INHERITS_FROM"
+    fi
+fi
+
+if [ -n "$BASE_DIR" ] && [ -f "$BASE_DIR/$INHERITS_FROM.json" ]; then
+    BASE_JSON="$BASE_DIR/$INHERITS_FROM.json"
     ASSET_INDEX=$(jq -r '.assetIndex.id // empty' "$BASE_JSON")
     [ -z "$ASSET_INDEX" ] && ASSET_INDEX=$(jq -r '.assetIndex.id // "'"$INHERITS_FROM"'"' "$VERSION_JSON")
-    BASE_JAR="$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.jar"
+    BASE_JAR="$BASE_DIR/$INHERITS_FROM.jar"
 
     mapfile -t BASE_LIBS < <(jq -c '.libraries[]' "$BASE_JSON" 2>/dev/null)
     for lib_raw in "${BASE_LIBS[@]}"; do
@@ -1447,7 +1520,7 @@ fi
 
 FULL_CLASSPATH=$(printf "%s\n" "${CP_ENTRIES[@]}" | sort -u | tr '\n' ':')
 NATIVES_PATH="$VERSIONS_DIR/$SELECTED_VERSION/natives"
-[ ! -d "$NATIVES_PATH" ] && [ -n "$INHERITS_FROM" ] && NATIVES_PATH="$VERSIONS_DIR/$INHERITS_FROM/natives"
+[ ! -d "$NATIVES_PATH" ] && [ -n "$BASE_DIR" ] && NATIVES_PATH="$BASE_DIR/natives"
 
 MAX_RAM=$(jq -r '.max_ram // "4G"' "$SETTINGS_FILE")
 MIN_RAM=$(jq -r '.min_ram // "2G"' "$SETTINGS_FILE")
@@ -1579,8 +1652,8 @@ extract_json_args() {
 }
 
 # Add dynamic JVM arguments from version JSON
-if [ -n "$INHERITS_FROM" ] && [ -f "$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.json" ]; then
-    mapfile -t BASE_JVM_ARGS < <(extract_json_args "$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.json" "arguments.jvm")
+if [ -n "$BASE_DIR" ] && [ -f "$BASE_DIR/$INHERITS_FROM.json" ]; then
+    mapfile -t BASE_JVM_ARGS < <(extract_json_args "$BASE_DIR/$INHERITS_FROM.json" "arguments.jvm")
     for arg in "${BASE_JVM_ARGS[@]}"; do
         [ -z "$arg" ] && continue
         [[ "$arg" == *java.library.path* ]] && continue
@@ -1611,8 +1684,8 @@ if [ ${#VER_GAME_ARGS[@]} -gt 0 ]; then
     done
 fi
 
-if [ -n "$INHERITS_FROM" ] && [ -f "$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.json" ]; then
-    mapfile -t BASE_GAME_ARGS < <(extract_json_args "$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.json" "arguments.game")
+if [ -n "$BASE_DIR" ] && [ -f "$BASE_DIR/$INHERITS_FROM.json" ]; then
+    mapfile -t BASE_GAME_ARGS < <(extract_json_args "$BASE_DIR/$INHERITS_FROM.json" "arguments.game")
     for arg in "${BASE_GAME_ARGS[@]}"; do
         expanded=$(substitute_vars "$arg")
         GAME_ARGS+=("$expanded")
@@ -1630,8 +1703,8 @@ done
 
 if [ "$has_user_arg" = false ]; then
     LEGACY_ARGS=$(jq -r '.minecraftArguments // empty' "$VERSION_JSON")
-    if [ -z "$LEGACY_ARGS" ] && [ -n "$INHERITS_FROM" ] && [ -f "$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.json" ]; then
-        LEGACY_ARGS=$(jq -r '.minecraftArguments // empty' "$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.json")
+    if [ -z "$LEGACY_ARGS" ] && [ -n "$BASE_DIR" ] && [ -f "$BASE_DIR/$INHERITS_FROM.json" ]; then
+        LEGACY_ARGS=$(jq -r '.minecraftArguments // empty' "$BASE_DIR/$INHERITS_FROM.json")
     fi
 
     if [ -n "$LEGACY_ARGS" ]; then

@@ -115,8 +115,7 @@ Your choice is remembered in `settings.json`. You can reconfigure this at any ti
              MINECRAFT CLI LAUNCHER           
 ==============================================
   Game Path:      /home/username/.minecraft
-  Versions Dir:   /home/username/.minecraft/versions
-  Active Mods:    ~/minecraft-cli/mods
+  Versions Dir:   /home/username/minecraft-cli/versions
   RAM:            -Xms2G / -Xmx4G
 ----------------------------------------------
 Installed Game Versions:
@@ -209,9 +208,6 @@ Offline player skins and capes are loaded directly into the game using the unive
 │       ├── mods/
 │       ├── resourcepacks/
 │       └── shaderpacks/
-├── mods/                  # Quick shortcut symlink to active version's mods directory
-├── resourcepacks/         # Quick shortcut symlink to active version's resourcepacks
-├── shaderpacks/           # Quick shortcut symlink to active version's shaderpacks
 ├── .minecraft/
 │   └── versions/
 │       ├── fabric-loader-0.19.5-1.21/
