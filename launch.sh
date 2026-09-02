@@ -13,9 +13,17 @@ CAPES_DIR="$CLI_DIR/capes"
 
 mkdir -p "$CLI_DIR" "$AUTHLIB_DIR" "$SKINS_DIR" "$CAPES_DIR"
 
-if [ ! -s "$ACCOUNTS_DB" ]; then
-    echo '{"accounts":[]}' > "$ACCOUNTS_DB"
-fi
+ensure_accounts_db() {
+    if [ ! -s "$ACCOUNTS_DB" ] || ! jq -e '.accounts and (.accounts | type == "array")' "$ACCOUNTS_DB" >/dev/null 2>&1; then
+        if [ -s "$ACCOUNTS_DB" ] && jq -e '.username and .type' "$ACCOUNTS_DB" >/dev/null 2>&1; then
+            jq '{accounts: [.]}' "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
+        else
+            echo '{"accounts":[]}' > "$ACCOUNTS_DB"
+        fi
+    fi
+}
+ensure_accounts_db
+
 
 if [ ! -s "$SETTINGS_FILE" ]; then
     cat << SETTINGS_EOF > "$SETTINGS_FILE"
@@ -532,7 +540,9 @@ manage_offline_skins() {
                         off_hash=$(printf "OfflinePlayer:%s" "$off_u" | md5sum | awk '{print $1}')
                         off_uuid="${off_hash:0:8}-${off_hash:8:4}-3${off_hash:13:3}-${off_hash:16:4}-${off_hash:20:12}"
                         new_entry=$(jq -n --arg u "$off_u" --arg id "$off_uuid" '{type: "offline", username: $u, uuid: $id, token: "0", server: null}')
-                        jq --argjson entry "$new_entry" '.accounts = [.accounts[] | select(.username != $entry.username or .type != "offline")] + [$entry]' \
+                        ensure_accounts_db
+                        jq --argjson entry "$new_entry" \
+                            '.accounts = [((.accounts // [])[] | select(.username != $entry.username or .type != "offline"))] + [$entry]' \
                             "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
                         echo -e "\e[1;32m[+] Offline account '$off_u' registered.\e[0m"
                         sleep 1
@@ -601,8 +611,9 @@ manage_offline_skins() {
                         curl -sL "$in_skin" -o "$dest"
                     fi
                     if [ -s "$dest" ]; then
+                        ensure_accounts_db
                         jq --arg u "$u_name" --arg p "$dest" \
-                            '(.accounts[] | select(.username == $u and .type == "offline")).skin = $p' \
+                            '.accounts = [((.accounts // [])[] | if (.username == $u and .type == "offline") then (.skin = $p) else . end)]' \
                             "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
                         echo -e "\e[1;32m[+] Skin set successfully!\e[0m"
                     else
@@ -622,8 +633,9 @@ manage_offline_skins() {
                         curl -sL "$in_cape" -o "$dest"
                     fi
                     if [ -s "$dest" ]; then
+                        ensure_accounts_db
                         jq --arg u "$u_name" --arg p "$dest" \
-                            '(.accounts[] | select(.username == $u and .type == "offline")).cape = $p' \
+                            '.accounts = [((.accounts // [])[] | if (.username == $u and .type == "offline") then (.cape = $p) else . end)]' \
                             "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
                         echo -e "\e[1;32m[+] Cape set successfully!\e[0m"
                     else
@@ -637,14 +649,15 @@ manage_offline_skins() {
                 echo "Enter Yggdrasil / Skin API server URL (e.g. https://elethiya.com/api/yggdrasil)"
                 echo "Leave empty to disable custom skin server."
                 read -rp "Server URL: " custom_srv
+                ensure_accounts_db
                 if [ -n "$custom_srv" ]; then
                     jq --arg u "$u_name" --arg s "$custom_srv" \
-                        '(.accounts[] | select(.username == $u and .type == "offline")).skin_server = $s' \
+                        '.accounts = [((.accounts // [])[] | if (.username == $u and .type == "offline") then (.skin_server = $s) else . end)]' \
                         "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
                     echo -e "\e[1;32m[+] Custom skin server set to: $custom_srv\e[0m"
                 else
                     jq --arg u "$u_name" \
-                        '(.accounts[] | select(.username == $u and .type == "offline")) | del(.skin_server)' \
+                        '.accounts = [((.accounts // [])[] | if (.username == $u and .type == "offline") then del(.skin_server) else . end)]' \
                         "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
                     echo -e "\e[1;33m[*] Custom skin server removed.\e[0m"
                 fi
@@ -652,8 +665,9 @@ manage_offline_skins() {
                 ;;
             4)
                 rm -f "$SKINS_DIR/${u_name}.png" "$CAPES_DIR/${u_name}.png"
+                ensure_accounts_db
                 jq --arg u "$u_name" \
-                    '(.accounts[] | select(.username == $u and .type == "offline")) | del(.skin) | del(.cape)' \
+                    '.accounts = [((.accounts // [])[] | if (.username == $u and .type == "offline") then (del(.skin) | del(.cape)) else . end)]' \
                     "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
                 echo -e "\e[1;32m[+] Skin and cape cleared.\e[0m"
                 sleep 1.2
@@ -813,7 +827,9 @@ manage_accounts() {
                         --arg u "$pname" --arg id "$uid" --arg t "$tok" --arg s "$in_srv" --arg ct "$client_tok" \
                         '{type: "authlib", username: $u, uuid: $id, token: $t, server: $s, clientToken: $ct}')
 
-                    jq --argjson entry "$new_entry" '.accounts = [.accounts[] | select(.username != $entry.username or .server != $entry.server)] + [$entry]' \
+                    ensure_accounts_db
+                    jq --argjson entry "$new_entry" \
+                        '.accounts = [((.accounts // [])[] | select(.username != $entry.username or (.server // "") != ($entry.server // "")))] + [$entry]' \
                         "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
                     echo -e "\e[1;32m[+] Account '$pname' added.\e[0m"
                     sleep 1.2
@@ -830,7 +846,9 @@ manage_accounts() {
                     off_hash=$(printf "OfflinePlayer:%s" "$off_u" | md5sum | awk '{print $1}')
                     off_uuid="${off_hash:0:8}-${off_hash:8:4}-3${off_hash:13:3}-${off_hash:16:4}-${off_hash:20:12}"
                     new_entry=$(jq -n --arg u "$off_u" --arg id "$off_uuid" '{type: "offline", username: $u, uuid: $id, token: "0", server: null}')
-                    jq --argjson entry "$new_entry" '.accounts = [.accounts[] | select(.username != $entry.username or .type != "offline")] + [$entry]' \
+                    ensure_accounts_db
+                    jq --argjson entry "$new_entry" \
+                        '.accounts = [((.accounts // [])[] | select(.username != $entry.username or .type != "offline"))] + [$entry]' \
                         "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
                     echo -e "\e[1;32m[+] Offline account '$off_u' registered.\e[0m"
                     sleep 1.2
@@ -843,8 +861,9 @@ manage_accounts() {
                     del_u=$(echo "$target_del" | jq -r '.username')
                     del_t=$(echo "$target_del" | jq -r '.type')
                     del_s=$(echo "$target_del" | jq -r '.server // empty')
+                    ensure_accounts_db
                     jq --arg u "$del_u" --arg t "$del_t" --arg s "$del_s" \
-                        '.accounts = [.accounts[] | select(.username != $u or .type != $t or (.server // "") != $s)]' \
+                        '.accounts = [((.accounts // [])[] | select(.username != $u or .type != $t or (.server // "") != $s))]' \
                         "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
                     echo -e "\e[1;32m[+] Account deleted.\e[0m"
                     sleep 1
@@ -956,8 +975,14 @@ while true; do
         a_srv=$(echo "$acc" | jq -r '.server // "Local"')
         printf "  \e[1;32m[%d]\e[0m %-18s (\e[1;34m%s\e[0m | %s)\n" "$((i+1))" "$u_name" "$a_type" "$a_srv"
     done
+    echo -e "  \e[1;31m[b]\e[0m Cancel / Exit"
     echo -e "\e[1;35m----------------------------------------------\e[0m"
-    read -rp "Select account number: " pick_acc
+    read -rp "Select account number or [b] to cancel: " pick_acc
+
+    if [ "$pick_acc" == "b" ] || [ "$pick_acc" == "B" ]; then
+        echo -e "\e[1;33m[*] Launch cancelled.\e[0m"
+        exit 0
+    fi
 
     if [[ "$pick_acc" =~ ^[0-9]+$ ]] && [ "$pick_acc" -ge 1 ] && [ "$pick_acc" -le "${#ACCOUNTS[@]}" ]; then
         SELECTED_RAW="${ACCOUNTS[$((pick_acc-1))]}"
@@ -968,26 +993,47 @@ while true; do
         SELECTED_SERVER=$(echo "$SELECTED_RAW" | jq -r '.server // empty')
         SELECTED_CLIENT_TOKEN=$(echo "$SELECTED_RAW" | jq -r '.clientToken // empty')
 
+        SERVER_ONLINE=true
         if [ "$SELECTED_TYPE" == "authlib" ]; then
-            echo -e "\n\e[1;34m==> Validating session with $SELECTED_SERVER...\e[0m"
-            VAL_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$SELECTED_SERVER/authserver/validate" \
-                -H "Content-Type: application/json" \
-                -d "{\"accessToken\": \"$SELECTED_TOKEN\", \"clientToken\": \"$SELECTED_CLIENT_TOKEN\"}")
+            echo -e "\n\e[1;34m==> Checking authentication server status...\e[0m"
+            SRV_STATUS=$(curl -sL --connect-timeout 4 --max-time 6 -o /dev/null -w "%{http_code}" "$SELECTED_SERVER")
 
-            if [ "$VAL_CODE" -ne 204 ] && [ "$VAL_CODE" -ne 200 ]; then
-                echo -e "\e[1;33m[*] Refreshing session...\e[0m"
-                REFRESH_RESP=$(curl -s --connect-timeout 8 --max-time 10 -X POST "$SELECTED_SERVER/authserver/refresh" \
+            if [ "$SRV_STATUS" -eq 200 ] || [ "$SRV_STATUS" -eq 204 ]; then
+                echo -e "\e[1;34m==> Validating session with $SELECTED_SERVER...\e[0m"
+                VAL_CODE=$(curl -s --connect-timeout 6 --max-time 8 -o /dev/null -w "%{http_code}" -X POST "$SELECTED_SERVER/authserver/validate" \
                     -H "Content-Type: application/json" \
-                    -d "{\"accessToken\": \"$SELECTED_TOKEN\", \"clientToken\": \"$SELECTED_CLIENT_TOKEN\", \"requestUser\": true}")
+                    -d "{\"accessToken\": \"$SELECTED_TOKEN\", \"clientToken\": \"$SELECTED_CLIENT_TOKEN\"}")
 
-                if [ -n "$REFRESH_RESP" ] && echo "$REFRESH_RESP" | jq -e . >/dev/null 2>&1; then
-                    NEW_TOKEN=$(echo "$REFRESH_RESP" | jq -r '.accessToken // empty' 2>/dev/null)
-                    if [ -n "$NEW_TOKEN" ]; then
-                        SELECTED_TOKEN="$NEW_TOKEN"
-                        jq --arg user "$SELECTED_USER" --arg srv "$SELECTED_SERVER" --arg tok "$NEW_TOKEN" \
-                           '(.accounts[] | select(.username == $user and .server == $srv)).token = $tok' \
-                           "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
+                if [ "$VAL_CODE" -ne 204 ] && [ "$VAL_CODE" -ne 200 ]; then
+                    echo -e "\e[1;33m[*] Refreshing session...\e[0m"
+                    REFRESH_RESP=$(curl -s --connect-timeout 6 --max-time 8 -X POST "$SELECTED_SERVER/authserver/refresh" \
+                        -H "Content-Type: application/json" \
+                        -d "{\"accessToken\": \"$SELECTED_TOKEN\", \"clientToken\": \"$SELECTED_CLIENT_TOKEN\", \"requestUser\": true}")
+
+                    if [ -n "$REFRESH_RESP" ] && echo "$REFRESH_RESP" | jq -e . >/dev/null 2>&1; then
+                        NEW_TOKEN=$(echo "$REFRESH_RESP" | jq -r '.accessToken // empty' 2>/dev/null)
+                        if [ -n "$NEW_TOKEN" ]; then
+                            ensure_accounts_db
+                            jq --arg user "$SELECTED_USER" --arg srv "$SELECTED_SERVER" --arg tok "$NEW_TOKEN" \
+                               '.accounts = [((.accounts // [])[] | if (.username == $user and (.server // "") == $srv) then (.token = $tok) else . end)]' \
+                               "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
+                        fi
                     fi
+                fi
+            else
+                SERVER_ONLINE=false
+                echo -e "\n\e[1;31m[-] Authlib server is currently offline or unreachable (HTTP ${SRV_STATUS:-Down}).\e[0m"
+                echo -e "\e[1;33m[*] Would you like to launch the game in offline mode instead?\e[0m"
+                read -rp "Launch in offline mode? [y/N]: " confirm_offline
+                if [[ "$confirm_offline" =~ ^[yY]([eE][sS])?$ ]]; then
+                    echo -e "\e[1;32m[+] Launching game in offline mode...\e[0m"
+                    SELECTED_TYPE="offline"
+                    SELECTED_TOKEN="0"
+                    sleep 1.2
+                else
+                    echo -e "\e[1;33m[*] Launch cancelled.\e[0m"
+                    sleep 1
+                    continue
                 fi
             fi
         fi
@@ -1093,13 +1139,18 @@ if [ -n "$EXTRA_JVM" ]; then
     JVM_FLAGS+=("${EXTRA_FLAGS[@]}")
 fi
 
-# Authlib agent & Custom Skin Server handling
+# Authlib agent & Custom Skin Server handling (only attached if server is online)
 if [ "$SELECTED_TYPE" == "authlib" ] && [ -n "$SELECTED_SERVER" ]; then
-    JVM_FLAGS+=("-javaagent:$AUTHLIB_JAR=$SELECTED_SERVER")
+    if [ "$SERVER_ONLINE" = true ]; then
+        JVM_FLAGS+=("-javaagent:$AUTHLIB_JAR=$SELECTED_SERVER")
+    fi
 elif [ "$SELECTED_TYPE" == "offline" ]; then
     OFF_SKIN_SRV=$(echo "$SELECTED_RAW" | jq -r '.skin_server // empty')
     if [ -n "$OFF_SKIN_SRV" ]; then
-        JVM_FLAGS+=("-javaagent:$AUTHLIB_JAR=$OFF_SKIN_SRV")
+        SKIN_SRV_STATUS=$(curl -sL --connect-timeout 3 --max-time 4 -o /dev/null -w "%{http_code}" "$OFF_SKIN_SRV")
+        if [ "$SKIN_SRV_STATUS" -eq 200 ] || [ "$SKIN_SRV_STATUS" -eq 204 ]; then
+            JVM_FLAGS+=("-javaagent:$AUTHLIB_JAR=$OFF_SKIN_SRV")
+        fi
     fi
 fi
 
