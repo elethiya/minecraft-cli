@@ -1,26 +1,24 @@
 #!/usr/bin/env bash
 
 # ==========================================
-# PATHS & CONFIGURATION
+# BASE DIRECTORIES & CONFIGURATION
 # ==========================================
-MC_DIR="$HOME/.minecraft"
-VERSIONS_DIR="$MC_DIR/versions"
-LIBS_DIR="$MC_DIR/libraries"
-ASSETS_DIR="$MC_DIR/assets"
-AUTHLIB_DIR="$MC_DIR/authlib"
+CLI_DIR="$HOME/minecraft-cli"
+SETTINGS_FILE="$CLI_DIR/settings.json"
+AUTHLIB_DIR="$CLI_DIR/authlib"
 AUTHLIB_JAR="$AUTHLIB_DIR/authlib-injector.jar"
 ACCOUNTS_DB="$AUTHLIB_DIR/accounts.json"
-SETTINGS_FILE="$AUTHLIB_DIR/settings.json"
 
-mkdir -p "$AUTHLIB_DIR"
+mkdir -p "$CLI_DIR" "$AUTHLIB_DIR"
 
 if [ ! -s "$ACCOUNTS_DB" ]; then
     echo '{"accounts":[]}' > "$ACCOUNTS_DB"
 fi
 
 if [ ! -s "$SETTINGS_FILE" ]; then
-    cat << 'SETTINGS_EOF' > "$SETTINGS_FILE"
+    cat << SETTINGS_EOF > "$SETTINGS_FILE"
 {
+  "game_dir": "$HOME/.minecraft",
   "max_ram": "4G",
   "min_ram": "2G",
   "jvm_args": "-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=20 -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=50 -XX:G1HeapRegionSize=32M"
@@ -28,58 +26,219 @@ if [ ! -s "$SETTINGS_FILE" ]; then
 SETTINGS_EOF
 fi
 
+# Ensure authlib-injector exists
 if [ ! -s "$AUTHLIB_JAR" ]; then
     echo -e "\e[1;34m==> Downloading authlib-injector...\e[0m"
     curl -sL "https://github.com/yushijinhun/authlib-injector/releases/download/v1.2.5/authlib-injector-1.2.5.jar" -o "$AUTHLIB_JAR" || \
     curl -sL "https://authlib-injector.yushijinhun.com/artifact/latest/authlib-injector.jar" -o "$AUTHLIB_JAR"
 fi
 
+# Helper function to refresh directory variables
+sync_directories() {
+    MC_DIR=$(jq -r '.game_dir // "'"$HOME/.minecraft"'"' "$SETTINGS_FILE")
+    VERSIONS_DIR="$MC_DIR/versions"
+    LIBS_DIR="$MC_DIR/libraries"
+    ASSETS_DIR="$MC_DIR/assets"
+    mkdir -p "$VERSIONS_DIR" "$LIBS_DIR" "$ASSETS_DIR/indexes" "$ASSETS_DIR/objects"
+}
+sync_directories
+
 # ==========================================
-# SETTINGS / RAM CONFIGURATION TUI
+# PROGRESS BAR HELPER
+# ==========================================
+render_progress_bar() {
+    local current=$1
+    local total=$2
+    local label=${3:-"Progress"}
+    local width=30
+    if [ "$total" -le 0 ]; then return; fi
+    local percent=$(( 100 * current / total ))
+    local filled=$(( width * current / total ))
+    local empty=$(( width - filled ))
+    
+    local bar_fill=$(printf "%*s" "$filled" "" | tr ' ' '#')
+    local bar_empty=$(printf "%*s" "$empty" "" | tr ' ' '-')
+    
+    printf "\r\e[1;34m%-15s\e[0m \e[1;36m[%s%s]\e[0m \e[1;32m%3d%%\e[0m (\e[1;33m%d/%d\e[0m)" "$label" "$bar_fill" "$bar_empty" "$percent" "$current" "$total"
+}
+
+# ==========================================
+# VERSION INSTALLER FUNCTION
+# ==========================================
+install_new_version() {
+    clear
+    echo -e "\e[1;35m==============================================\e[0m"
+    echo -e "\e[1;36m           MINECRAFT VERSION INSTALLER        \e[0m"
+    echo -e "\e[1;35m==============================================\e[0m"
+    echo -e "Target Directory: \e[1;32m$MC_DIR\e[0m\n"
+
+    echo -e "\e[1;34m==> Fetching Mojang version manifest...\e[0m"
+    MANIFEST_JSON=$(curl -s "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+    if [ -z "$MANIFEST_JSON" ]; then
+        echo -e "\e[1;31m[-] Failed to fetch official version manifest.\e[0m"
+        read -rp "Press Enter to return..."
+        return
+    fi
+
+    LATEST_RELEASE=$(echo "$MANIFEST_JSON" | jq -r '.latest.release')
+    mapfile -t TOP_RELEASES < <(echo "$MANIFEST_JSON" | jq -r '[.versions[] | select(.type=="release")][0:10] | .[].id')
+
+    echo -e "\e[1;33mPopular / Recent Official Releases:\e[0m"
+    for i in "${!TOP_RELEASES[@]}"; do
+        printf "  \e[1;32m[%d]\e[0m %s\n" "$((i+1))" "${TOP_RELEASES[$i]}"
+    done
+    echo -e "  \e[1;33m[c]\e[0m Type a custom version ID (e.g. 1.20.4, 1.16.5)"
+    echo -e "  \e[1;31m[b]\e[0m Back"
+    echo -e "\e[1;35m----------------------------------------------\e[0m"
+    read -rp "Select version to install: " v_opt
+
+    local target_ver=""
+    if [[ "$v_opt" =~ ^[0-9]+$ ]] && [ "$v_opt" -ge 1 ] && [ "$v_opt" -le "${#TOP_RELEASES[@]}" ]; then
+        target_ver="${TOP_RELEASES[$((v_opt-1))]}"
+    elif [ "$v_opt" == "c" ] || [ "$v_opt" == "C" ]; then
+        read -rp "Enter exact Minecraft version: " target_ver
+    else
+        return
+    fi
+
+    if [ -z "$target_ver" ]; then return; fi
+
+    VERSION_URL=$(echo "$MANIFEST_JSON" | jq -r --arg v "$target_ver" '.versions[] | select(.id == $v) | .url')
+    if [ -z "$VERSION_URL" ] || [ "$VERSION_URL" == "null" ]; then
+        echo -e "\e[1;31m[-] Version '$target_ver' not found in official manifest.\e[0m"
+        read -rp "Press Enter to return..."
+        return
+    fi
+
+    TARGET_VER_DIR="$VERSIONS_DIR/$target_ver"
+    mkdir -p "$TARGET_VER_DIR" "$TARGET_VER_DIR/natives"
+
+    echo -e "\n\e[1;34m==> [1/4] Downloading version metadata ($target_ver.json)...\e[0m"
+    TARGET_VER_JSON="$TARGET_VER_DIR/$target_ver.json"
+    curl -sL "$VERSION_URL" -o "$TARGET_VER_JSON"
+
+    echo -e "\e[1;34m==> [2/4] Downloading client binary ($target_ver.jar)...\e[0m"
+    CLIENT_URL=$(jq -r '.downloads.client.url' "$TARGET_VER_JSON")
+    TARGET_JAR="$TARGET_VER_DIR/$target_ver.jar"
+    curl -sL "$CLIENT_URL" -o "$TARGET_JAR"
+
+    echo -e "\e[1;34m==> [3/4] Downloading version libraries...\e[0m"
+    mapfile -t LIBS_LIST < <(jq -r '.libraries[] | select(.downloads.artifact != null) | .downloads.artifact | "\(.path)|\(.url)"' "$TARGET_VER_JSON")
+    local total_libs=${#LIBS_LIST[@]}
+    local curr_lib=0
+    for item in "${LIBS_LIST[@]}"; do
+        l_path="${item%%|*}"
+        l_url="${item##*|}"
+        dest="$LIBS_DIR/$l_path"
+        if [ ! -s "$dest" ]; then
+            mkdir -p "$(dirname "$dest")"
+            curl -sL "$l_url" -o "$dest"
+        fi
+        ((curr_lib++))
+        render_progress_bar "$curr_lib" "$total_libs" "Libraries"
+    done
+    echo ""
+
+    find "$LIBS_DIR" -name "*natives-linux*.jar" -exec unzip -n -q -d "$TARGET_VER_DIR/natives" {} + 2>/dev/null || true
+
+    echo -e "\e[1;34m==> [4/4] Verifying and downloading assets...\e[0m"
+    A_INDEX_NAME=$(jq -r '.assetIndex.id' "$TARGET_VER_JSON")
+    A_INDEX_URL=$(jq -r '.assetIndex.url' "$TARGET_VER_JSON")
+    A_INDEX_FILE="$ASSETS_DIR/indexes/$A_INDEX_NAME.json"
+
+    if [ ! -s "$A_INDEX_FILE" ]; then
+        curl -sL "$A_INDEX_URL" -o "$A_INDEX_FILE"
+    fi
+
+    mapfile -t HASH_LIST < <(jq -r '.objects | to_entries[] | .value.hash' "$A_INDEX_FILE")
+    MISSING_ASSETS=()
+    for h in "${HASH_LIST[@]}"; do
+        pfx="${h:0:2}"
+        if [ ! -s "$ASSETS_DIR/objects/$pfx/$h" ]; then
+            MISSING_ASSETS+=("$h")
+        fi
+    done
+
+    local total_missing=${#MISSING_ASSETS[@]}
+    if [ "$total_missing" -gt 0 ]; then
+        echo "  Downloading $total_missing missing assets in parallel..."
+        export ASSETS_DIR
+        dl_asset() {
+            local h="$1"
+            local p="${h:0:2}"
+            mkdir -p "$ASSETS_DIR/objects/$p"
+            curl -sL "https://resources.download.minecraft.net/$p/$h" -o "$ASSETS_DIR/objects/$p/$h"
+        }
+        export -f dl_asset
+        printf "%s\n" "${MISSING_ASSETS[@]}" | xargs -n 1 -P 16 -I {} bash -c 'dl_asset "$@"' _ {}
+    fi
+
+    echo -e "\n\e[1;32m[+] Version $target_ver installed successfully in $TARGET_VER_DIR!\e[0m"
+    read -rp "Press Enter to return..."
+}
+
+# ==========================================
+# SETTINGS / DIRECTORY & RAM CONFIGURATION TUI
 # ==========================================
 configure_settings() {
     while true; do
+        sync_directories
         MAX_RAM=$(jq -r '.max_ram // "4G"' "$SETTINGS_FILE")
         MIN_RAM=$(jq -r '.min_ram // "2G"' "$SETTINGS_FILE")
         JVM_ARGS=$(jq -r '.jvm_args // ""' "$SETTINGS_FILE")
 
         clear
         echo -e "\e[1;35m==============================================\e[0m"
-        echo -e "\e[1;36m           LAUNCHER & RAM SETTINGS            \e[0m"
+        echo -e "\e[1;36m       LAUNCHER DIRECTORY & RAM SETTINGS      \e[0m"
         echo -e "\e[1;35m==============================================\e[0m"
-        printf "  \e[1;33m[1]\e[0m Maximum RAM (-Xmx) : \e[1;32m%s\e[0m\n" "$MAX_RAM"
-        printf "  \e[1;33m[2]\e[0m Minimum RAM (-Xms) : \e[1;32m%s\e[0m\n" "$MIN_RAM"
-        printf "  \e[1;33m[3]\e[0m Custom JVM Flags   : \e[1;34m%s\e[0m\n" "$JVM_ARGS"
+        printf "  \e[1;33m[1]\e[0m Game Directory     : \e[1;32m%s\e[0m\n" "$MC_DIR"
+        printf "  \e[1;33m[2]\e[0m Maximum RAM (-Xmx) : \e[1;32m%s\e[0m\n" "$MAX_RAM"
+        printf "  \e[1;33m[3]\e[0m Minimum RAM (-Xms) : \e[1;32m%s\e[0m\n" "$MIN_RAM"
+        printf "  \e[1;33m[4]\e[0m Custom JVM Flags   : \e[1;34m%s\e[0m\n" "$JVM_ARGS"
         echo -e "\n  \e[1;32m[b]\e[0m Save and Back to Main Menu"
         echo -e "\e[1;35m----------------------------------------------\e[0m"
         read -rp "Select option: " s_choice
 
         case "$s_choice" in
             1)
-                echo -e "\nExamples: 2G, 4G, 6G, 8G, 1024M"
-                read -rp "Enter Maximum RAM (-Xmx): " new_max
+                echo -e "\nChoose Game Directory Location:"
+                echo -e "  [1] Standard ~/.minecraft"
+                echo -e "  [2] Inside minecraft-cli ($CLI_DIR/instances)"
+                echo -e "  [3] Custom full path"
+                read -rp "Select [1-3]: " dir_choice
+                case "$dir_choice" in
+                    1)
+                        jq --arg d "$HOME/.minecraft" '.game_dir = $d' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+                        ;;
+                    2)
+                        mkdir -p "$CLI_DIR/instances"
+                        jq --arg d "$CLI_DIR/instances" '.game_dir = $d' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+                        ;;
+                    3)
+                        read -rp "Enter absolute folder path: " custom_dir
+                        if [ -n "$custom_dir" ]; then
+                            mkdir -p "$custom_dir"
+                            jq --arg d "$custom_dir" '.game_dir = $d' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+                        fi
+                        ;;
+                esac
+                ;;
+            2)
+                read -rp "Enter Maximum RAM (e.g. 4G, 6G, 4096M): " new_max
                 if [[ "$new_max" =~ ^[0-9]+[GMgm]$ ]]; then
                     new_max="${new_max^^}"
                     jq --arg r "$new_max" '.max_ram = $r' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
-                else
-                    echo -e "\e[1;31m[-] Invalid format! Use e.g. 4G or 4096M\e[0m"
-                    sleep 1.5
-                fi
-                ;;
-            2)
-                echo -e "\nExamples: 1G, 2G, 4G, 1024M"
-                read -rp "Enter Minimum RAM (-Xms): " new_min
-                if [[ "$new_min" =~ ^[0-9]+[GMgm]$ ]]; then
-                    new_min="${new_min^^}"
-                    jq --arg r "$new_min" '.min_ram = $r' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
-                else
-                    echo -e "\e[1;31m[-] Invalid format! Use e.g. 2G or 2048M\e[0m"
-                    sleep 1.5
                 fi
                 ;;
             3)
-                echo -e "\nEnter extra JVM flags (space-separated):"
-                read -rp "> " new_flags
+                read -rp "Enter Minimum RAM (e.g. 2G, 2048M): " new_min
+                if [[ "$new_min" =~ ^[0-9]+[GMgm]$ ]]; then
+                    new_min="${new_min^^}"
+                    jq --arg r "$new_min" '.min_ram = $r' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+                fi
+                ;;
+            4)
+                read -rp "Enter extra JVM flags: " new_flags
                 jq --arg f "$new_flags" '.jvm_args = $f' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
                 ;;
             b|B)
@@ -127,7 +286,7 @@ manage_accounts() {
 
         case "$a_opt" in
             a|A)
-                echo -e "\n\e[1;36m-- Add Authlib (Yggdrasil) Account --\e[0m"
+                echo -e "\n\e[1;36m-- Add Authlib Account --\e[0m"
                 read -rp "Authlib API Root URL [default: https://elethiya.com/api/yggdrasil]: " in_srv
                 in_srv="${in_srv:-https://elethiya.com/api/yggdrasil}"
                 read -rp "Username / Email: " in_user
@@ -136,9 +295,7 @@ manage_accounts() {
 
                 client_tok=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N | md5sum | head -c 32)
                 auth_payload=$(jq -n \
-                  --arg user "$in_user" \
-                  --arg pass "$in_pass" \
-                  --arg client "$client_tok" \
+                  --arg user "$in_user" --arg pass "$in_pass" --arg client "$client_tok" \
                   '{agent: {name: "Minecraft", version: 1}, username: $user, password: $pass, clientToken: $client, requestUser: true}')
 
                 auth_resp=$(curl -s -X POST "$in_srv/authserver/authenticate" \
@@ -156,7 +313,7 @@ manage_accounts() {
 
                     jq --argjson entry "$new_entry" '.accounts = [.accounts[] | select(.username != $entry.username or .server != $entry.server)] + [$entry]' \
                         "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
-                    echo -e "\e[1;32m[+] Account '$pname' registered.\e[0m"
+                    echo -e "\e[1;32m[+] Account '$pname' added.\e[0m"
                     sleep 1.2
                 else
                     err_check=$(echo "$auth_resp" | jq -r '.errorMessage // "Authentication failed"')
@@ -199,9 +356,10 @@ manage_accounts() {
 }
 
 # ==========================================
-# MAIN INTERACTIVE LAUNCHER MENU
+# MAIN INTERACTIVE MENU
 # ==========================================
 while true; do
+    sync_directories
     MAX_RAM=$(jq -r '.max_ram // "4G"' "$SETTINGS_FILE")
     MIN_RAM=$(jq -r '.min_ram // "2G"' "$SETTINGS_FILE")
 
@@ -212,12 +370,13 @@ while true; do
     echo -e "\e[1;35m==============================================\e[0m"
     echo -e "\e[1;36m             MINECRAFT CLI LAUNCHER           \e[0m"
     echo -e "\e[1;35m==============================================\e[0m"
-    printf "  \e[1;37mActive RAM Profile:\e[0m  -Xms\e[1;32m%s\e[0m / -Xmx\e[1;32m%s\e[0m\n" "$MIN_RAM" "$MAX_RAM"
+    printf "  \e[1;37mGame Path:\e[0m  \e[1;32m%s\e[0m\n" "$MC_DIR"
+    printf "  \e[1;37mRAM:\e[0m        -Xms\e[1;32m%s\e[0m / -Xmx\e[1;32m%s\e[0m\n" "$MIN_RAM" "$MAX_RAM"
     echo -e "\e[1;35m----------------------------------------------\e[0m"
 
     echo -e "\e[1;33mInstalled Game Versions:\e[0m"
     if [ ${#INSTALLED_VERSIONS[@]} -eq 0 ]; then
-        echo -e "  \e[1;31mNo versions found in ~/.minecraft/versions\e[0m"
+        echo -e "  \e[1;31mNo versions installed in current directory.\e[0m"
     else
         for i in "${!INSTALLED_VERSIONS[@]}"; do
             v_name="${INSTALLED_VERSIONS[$i]}"
@@ -229,14 +388,18 @@ while true; do
         done
     fi
 
-    echo -e "\n\e[1;33mConfiguration & Controls:\e[0m"
-    echo -e "  \e[1;33m[r]\e[0m Configure RAM & JVM Flags"
-    echo -e "  \e[1;33m[u]\e[0m Manage Accounts (Add/Delete/Authlib/Offline)"
+    echo -e "\n\e[1;33mCommands & Tools:\e[0m"
+    echo -e "  \e[1;32m[i]\e[0m Install New Minecraft Version"
+    echo -e "  \e[1;33m[r]\e[0m Configure Directory, RAM & JVM Flags"
+    echo -e "  \e[1;33m[u]\e[0m Manage Accounts (Authlib / Offline)"
     echo -e "  \e[1;31m[q]\e[0m Quit"
     echo -e "\e[1;35m----------------------------------------------\e[0m"
-    read -rp "Select version number to launch or menu option: " main_choice
+    read -rp "Select version number to launch or tool option: " main_choice
 
     case "$main_choice" in
+        i|I)
+            install_new_version
+            ;;
         r|R)
             configure_settings
             ;;
@@ -256,7 +419,7 @@ while true; do
 done
 
 # ==========================================
-# SELECT ACTIVE ACCOUNT FOR THIS SESSION
+# SELECT ACTIVE ACCOUNT
 # ==========================================
 if [ ${#ACCOUNTS[@]} -eq 0 ]; then
     echo -e "\n\e[1;31m[-] No accounts found. Please add an account first.\e[0m"
@@ -295,7 +458,7 @@ while true; do
                 -d "{\"accessToken\": \"$SELECTED_TOKEN\", \"clientToken\": \"$SELECTED_CLIENT_TOKEN\"}")
 
             if [ "$VAL_CODE" -ne 204 ] && [ "$VAL_CODE" -ne 200 ]; then
-                echo -e "\e[1;33m[*] Refreshing token...\e[0m"
+                echo -e "\e[1;33m[*] Refreshing session...\e[0m"
                 REFRESH_RESP=$(curl -s -X POST "$SELECTED_SERVER/authserver/refresh" \
                     -H "Content-Type: application/json" \
                     -d "{\"accessToken\": \"$SELECTED_TOKEN\", \"clientToken\": \"$SELECTED_CLIENT_TOKEN\", \"requestUser\": true}")
@@ -320,7 +483,6 @@ VERSION_JSON="$VERSIONS_DIR/$SELECTED_VERSION/$SELECTED_VERSION.json"
 MAIN_CLASS=$(jq -r '.mainClass' "$VERSION_JSON")
 INHERITS_FROM=$(jq -r '.inheritsFrom // empty' "$VERSION_JSON")
 
-# Determine active Game Directory (check if HMCL isolated this instance)
 INSTANCE_DIR="$VERSIONS_DIR/$SELECTED_VERSION"
 if [ -d "$INSTANCE_DIR/mods" ] || [ -d "$INSTANCE_DIR/resourcepacks" ]; then
     ACTIVE_GAMEDIR="$INSTANCE_DIR"
@@ -328,7 +490,6 @@ else
     ACTIVE_GAMEDIR="$MC_DIR"
 fi
 
-# Ensure standard mod & pack folders exist in the active game directory
 mkdir -p "$ACTIVE_GAMEDIR/mods" "$ACTIVE_GAMEDIR/resourcepacks" "$ACTIVE_GAMEDIR/shaderpacks"
 
 CP_ENTRIES=()
@@ -381,7 +542,6 @@ JVM_FLAGS=(
     "-Djava.library.path=$NATIVES_PATH"
 )
 
-# Crucial Fabric / Modloader JVM properties
 if [ -n "$BASE_JAR" ] && [ -f "$BASE_JAR" ]; then
     JVM_FLAGS+=("-Dfabric.gameJarPath=$BASE_JAR")
 fi
