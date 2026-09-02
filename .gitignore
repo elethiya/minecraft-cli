@@ -1,2 +1,8 @@
 authlib/
 settings.json
+instances/
+.minecraft/
+skins/
+capes/
+*.log
+*.jar
