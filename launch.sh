@@ -786,13 +786,27 @@ manage_accounts() {
                   --arg user "$in_user" --arg pass "$in_pass" --arg client "$client_tok" \
                   '{agent: {name: "Minecraft", version: 1}, username: $user, password: $pass, clientToken: $client, requestUser: true}')
 
-                auth_resp=$(curl -s -X POST "$in_srv/authserver/authenticate" \
+                echo -e "\e[1;34m==> Authenticating with $in_srv...\e[0m"
+                auth_resp=$(curl -s --connect-timeout 8 --max-time 15 -X POST "$in_srv/authserver/authenticate" \
                   -H "Content-Type: application/json" \
                   -d "$auth_payload")
 
-                tok=$(echo "$auth_resp" | jq -r '.accessToken // empty')
-                uid=$(echo "$auth_resp" | jq -r '.selectedProfile.id // empty')
-                pname=$(echo "$auth_resp" | jq -r '.selectedProfile.name // empty')
+                if [ -z "$auth_resp" ]; then
+                    echo -e "\e[1;31m[-] Connection failed: Server did not respond or URL is unreachable.\e[0m"
+                    read -rp "Press Enter to continue..."
+                    continue
+                fi
+
+                if ! echo "$auth_resp" | jq -e . >/dev/null 2>&1; then
+                    echo -e "\e[1;31m[-] Invalid response: Server returned non-JSON data (e.g. 404/502 error or offline server).\e[0m"
+                    echo -e "\e[1;33m[*] Please verify the Authlib API Root URL and ensure the server is online.\e[0m"
+                    read -rp "Press Enter to continue..."
+                    continue
+                fi
+
+                tok=$(echo "$auth_resp" | jq -r '.accessToken // empty' 2>/dev/null)
+                uid=$(echo "$auth_resp" | jq -r '.selectedProfile.id // empty' 2>/dev/null)
+                pname=$(echo "$auth_resp" | jq -r '.selectedProfile.name // empty' 2>/dev/null)
 
                 if [ -n "$tok" ] && [ -n "$pname" ]; then
                     new_entry=$(jq -n \
@@ -804,7 +818,7 @@ manage_accounts() {
                     echo -e "\e[1;32m[+] Account '$pname' added.\e[0m"
                     sleep 1.2
                 else
-                    err_check=$(echo "$auth_resp" | jq -r '.errorMessage // "Authentication failed"')
+                    err_check=$(echo "$auth_resp" | jq -r '.errorMessage // .error // .message // "Authentication failed"' 2>/dev/null)
                     echo -e "\e[1;31m[-] $err_check\e[0m"
                     read -rp "Press Enter to continue..."
                 fi
@@ -962,16 +976,18 @@ while true; do
 
             if [ "$VAL_CODE" -ne 204 ] && [ "$VAL_CODE" -ne 200 ]; then
                 echo -e "\e[1;33m[*] Refreshing session...\e[0m"
-                REFRESH_RESP=$(curl -s -X POST "$SELECTED_SERVER/authserver/refresh" \
+                REFRESH_RESP=$(curl -s --connect-timeout 8 --max-time 10 -X POST "$SELECTED_SERVER/authserver/refresh" \
                     -H "Content-Type: application/json" \
                     -d "{\"accessToken\": \"$SELECTED_TOKEN\", \"clientToken\": \"$SELECTED_CLIENT_TOKEN\", \"requestUser\": true}")
 
-                NEW_TOKEN=$(echo "$REFRESH_RESP" | jq -r '.accessToken // empty')
-                if [ -n "$NEW_TOKEN" ]; then
-                    SELECTED_TOKEN="$NEW_TOKEN"
-                    jq --arg user "$SELECTED_USER" --arg srv "$SELECTED_SERVER" --arg tok "$NEW_TOKEN" \
-                       '(.accounts[] | select(.username == $user and .server == $srv)).token = $tok' \
-                       "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
+                if [ -n "$REFRESH_RESP" ] && echo "$REFRESH_RESP" | jq -e . >/dev/null 2>&1; then
+                    NEW_TOKEN=$(echo "$REFRESH_RESP" | jq -r '.accessToken // empty' 2>/dev/null)
+                    if [ -n "$NEW_TOKEN" ]; then
+                        SELECTED_TOKEN="$NEW_TOKEN"
+                        jq --arg user "$SELECTED_USER" --arg srv "$SELECTED_SERVER" --arg tok "$NEW_TOKEN" \
+                           '(.accounts[] | select(.username == $user and .server == $srv)).token = $tok' \
+                           "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
+                    fi
                 fi
             fi
         fi
