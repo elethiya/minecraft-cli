@@ -25,22 +25,191 @@ ensure_accounts_db() {
 ensure_accounts_db
 
 
-if [ ! -s "$SETTINGS_FILE" ]; then
-    cat << SETTINGS_EOF > "$SETTINGS_FILE"
+setup_first_time_directory() {
+    if [ ! -s "$SETTINGS_FILE" ] || [ -z "$(jq -r '.game_dir // empty' "$SETTINGS_FILE" 2>/dev/null)" ]; then
+        clear
+        echo -e "\e[1;35m==============================================\e[0m"
+        echo -e "\e[1;36m         WELCOME TO MINECRAFT LAUNCHER        \e[0m"
+        echo -e "\e[1;35m==============================================\e[0m"
+        echo -e "  Please select the directory where you want to"
+        echo -e "  install and store your Minecraft game files:\n"
+        echo -e "  \e[1;32m[1]\e[0m Standard \e[1;33m~/.minecraft\e[0m"
+        echo -e "      (Default location: $HOME/.minecraft)\n"
+        echo -e "  \e[1;32m[2]\e[0m Inside Launcher Directory"
+        echo -e "      (Location: $CLI_DIR/.minecraft)\n"
+        echo -e "  \e[1;32m[3]\e[0m Custom Path"
+        echo -e "      (Specify any folder on your system)"
+        echo -e "\e[1;35m----------------------------------------------\e[0m"
+        read -rp "Select an option [1-3, default: 1]: " first_choice
+
+        local chosen_dir="$HOME/.minecraft"
+        case "$first_choice" in
+            2)
+                chosen_dir="$CLI_DIR/.minecraft"
+                ;;
+            3)
+                while true; do
+                    read -rp "Enter directory path: " custom_input
+                    custom_input="${custom_input/#\~/$HOME}"
+                    if [ -n "$custom_input" ]; then
+                        chosen_dir="$custom_input"
+                        break
+                    fi
+                    echo -e "\e[1;31m[-] Path cannot be empty.\e[0m"
+                done
+                ;;
+            *)
+                chosen_dir="$HOME/.minecraft"
+                ;;
+        esac
+
+        mkdir -p "$chosen_dir"
+        echo -e "\e[1;32m[+] Game directory set to: $chosen_dir\e[0m"
+
+        local cur_max="4G"
+        local cur_min="2G"
+        local cur_jvm="-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=20 -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=50 -XX:G1HeapRegionSize=32M --enable-native-access=ALL-UNNAMED"
+        if [ -s "$SETTINGS_FILE" ]; then
+            cur_max=$(jq -r '.max_ram // "4G"' "$SETTINGS_FILE" 2>/dev/null)
+            cur_min=$(jq -r '.min_ram // "2G"' "$SETTINGS_FILE" 2>/dev/null)
+            cur_jvm=$(jq -r '.jvm_args // "-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=20 -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=50 -XX:G1HeapRegionSize=32M --enable-native-access=ALL-UNNAMED"' "$SETTINGS_FILE" 2>/dev/null)
+        fi
+
+        cat << SETTINGS_EOF > "$SETTINGS_FILE"
 {
-  "game_dir": "$HOME/.minecraft",
-  "max_ram": "4G",
-  "min_ram": "2G",
-  "jvm_args": "-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=20 -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=50 -XX:G1HeapRegionSize=32M --enable-native-access=ALL-UNNAMED"
+  "game_dir": "$chosen_dir",
+  "max_ram": "$cur_max",
+  "min_ram": "$cur_min",
+  "jvm_args": "$cur_jvm"
 }
 SETTINGS_EOF
-fi
+        sleep 1.2
+    fi
+}
+setup_first_time_directory
+
+# ==========================================
+# PROGRESS BAR HELPER WITH SPEED & ETA
+# ==========================================
+render_progress_bar() {
+    local current=$1
+    local total=$2
+    local label=${3:-"Progress"}
+    local start_ms=${4:-0}
+    local cur_bytes=${5:-0}
+    local tot_bytes=${6:-0}
+    local width=22
+
+    if [ "$total" -le 0 ]; then return; fi
+    local percent=$(( 100 * current / total ))
+    [ "$percent" -gt 100 ] && percent=100
+    local filled=$(( width * percent / 100 ))
+    local empty=$(( width - filled ))
+
+    local bar_fill=$(printf "%*s" "$filled" "" | tr ' ' '#')
+    local bar_empty=$(printf "%*s" "$empty" "" | tr ' ' '-')
+
+    local extra_info=""
+    local now_ms=$(date +%s%3N 2>/dev/null || date +%s)
+    local elapsed_ms=$(( now_ms - start_ms ))
+
+    if [ "$start_ms" -gt 0 ] && [ "$elapsed_ms" -ge 150 ]; then
+        if [ "$cur_bytes" -gt 0 ]; then
+            local speed_bps=$(( (cur_bytes * 1000) / elapsed_ms ))
+            local speed_str=""
+            if [ "$speed_bps" -ge 1048576 ]; then
+                speed_str=$(awk -v b="$speed_bps" 'BEGIN { printf "%.2f MB/s", b / 1048576 }')
+            elif [ "$speed_bps" -ge 1024 ]; then
+                speed_str=$(awk -v b="$speed_bps" 'BEGIN { printf "%.1f KB/s", b / 1024 }')
+            else
+                speed_str="${speed_bps} B/s"
+            fi
+
+            local eta_str="--"
+            if [ "$tot_bytes" -gt 0 ] && [ "$speed_bps" -gt 0 ]; then
+                local rem_bytes=$(( tot_bytes - cur_bytes ))
+                if [ "$rem_bytes" -gt 0 ]; then
+                    local rem_sec=$(( rem_bytes / speed_bps ))
+                    if [ "$rem_sec" -ge 3600 ]; then
+                        eta_str=$(printf "%02dh %02dm" $(( rem_sec / 3600 )) $(( (rem_sec % 3600) / 60 )))
+                    elif [ "$rem_sec" -ge 60 ]; then
+                        eta_str=$(printf "%02dm %02ds" $(( rem_sec / 60 )) $(( rem_sec % 60 )))
+                    else
+                        eta_str=$(printf "%02ds" "$rem_sec")
+                    fi
+                else
+                    eta_str="00s"
+                fi
+            fi
+            extra_info=" \e[1;33m$speed_str\e[0m | \e[1;36mETA: $eta_str\e[0m"
+        else
+            local items_per_sec=$(awk -v c="$current" -v e="$elapsed_ms" 'BEGIN { printf "%.1f", (c * 1000) / e }')
+            local rem_items=$(( total - current ))
+            local rem_sec=0
+            [ "$current" -gt 0 ] && rem_sec=$(( (rem_items * elapsed_ms) / (current * 1000) ))
+            local eta_str="--"
+            if [ "$rem_sec" -ge 60 ]; then
+                eta_str=$(printf "%02dm %02ds" $(( rem_sec / 60 )) $(( rem_sec % 60 )))
+            else
+                eta_str=$(printf "%02ds" "$rem_sec")
+            fi
+            extra_info=" \e[1;33m${items_per_sec} items/s\e[0m | \e[1;36mETA: $eta_str\e[0m"
+        fi
+    else
+        extra_info=" \e[1;30m-- MB/s | ETA: --\e[0m"
+    fi
+
+    local current_fmt="$current"
+    local total_fmt="$total"
+    if [ "$tot_bytes" -gt 0 ] && [ "$tot_bytes" -eq "$total" ]; then
+        if [ "$tot_bytes" -ge 1048576 ]; then
+            current_fmt=$(awk -v b="$current" 'BEGIN { printf "%.1f", b / 1048576 }')
+            total_fmt=$(awk -v b="$total" 'BEGIN { printf "%.1f MB", b / 1048576 }')
+        elif [ "$tot_bytes" -ge 1024 ]; then
+            current_fmt=$(awk -v b="$current" 'BEGIN { printf "%.1f", b / 1024 }')
+            total_fmt=$(awk -v b="$total" 'BEGIN { printf "%.1f KB", b / 1024 }')
+        fi
+    fi
+
+    printf "\r\e[1;34m%-12s\e[0m \e[1;36m[%s%s]\e[0m \e[1;32m%3d%%\e[0m (\e[1;33m%s/%s\e[0m)%b \033[K" \
+        "$label" "$bar_fill" "$bar_empty" "$percent" "$current_fmt" "$total_fmt" "$extra_info"
+}
+
+download_single_file_with_progress() {
+    local url="$1"
+    local dest="$2"
+    local label=${3:-"Downloading"}
+    local expected_size=${4:-0}
+
+    mkdir -p "$(dirname "$dest")"
+    rm -f "$dest"
+
+    local start_ms=$(date +%s%3N 2>/dev/null || date +%s)
+    curl -sL "$url" -o "$dest" &
+    local c_pid=$!
+
+    if [ "$expected_size" -le 0 ]; then
+        expected_size=$(curl -sI --connect-timeout 2 --max-time 3 -L "$url" 2>/dev/null | grep -i "^content-length:" | tail -n 1 | awk '{print $2}' | tr -d '\r' || echo 0)
+        expected_size=${expected_size:-0}
+    fi
+
+    while kill -0 "$c_pid" 2>/dev/null; do
+        local cur_sz=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+        local display_tot="${expected_size:-0}"
+        [ "$display_tot" -le 0 ] && display_tot="$cur_sz"
+        render_progress_bar "$cur_sz" "$display_tot" "$label" "$start_ms" "$cur_sz" "$expected_size"
+        sleep 0.1
+    done
+    wait "$c_pid"
+    local cur_sz=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+    render_progress_bar "$cur_sz" "$cur_sz" "$label" "$start_ms" "$cur_sz" "$cur_sz"
+    echo ""
+}
 
 # Ensure authlib-injector exists
 if [ ! -s "$AUTHLIB_JAR" ]; then
     echo -e "\e[1;34m==> Downloading authlib-injector...\e[0m"
-    curl -sL "https://github.com/yushijinhun/authlib-injector/releases/download/v1.2.5/authlib-injector-1.2.5.jar" -o "$AUTHLIB_JAR" || \
-    curl -sL "https://authlib-injector.yushijinhun.com/artifact/latest/authlib-injector.jar" -o "$AUTHLIB_JAR"
+    download_single_file_with_progress "https://github.com/yushijinhun/authlib-injector/releases/download/v1.2.5/authlib-injector-1.2.5.jar" "$AUTHLIB_JAR" "Authlib Agent"
 fi
 
 # Helper function to refresh directory variables
@@ -49,28 +218,52 @@ sync_directories() {
     VERSIONS_DIR="$MC_DIR/versions"
     LIBS_DIR="$MC_DIR/libraries"
     ASSETS_DIR="$MC_DIR/assets"
-    mkdir -p "$VERSIONS_DIR" "$LIBS_DIR" "$ASSETS_DIR/indexes" "$ASSETS_DIR/objects"
+    mkdir -p "$VERSIONS_DIR" "$LIBS_DIR" "$ASSETS_DIR/indexes" "$ASSETS_DIR/objects" "$SKINS_DIR" "$CAPES_DIR" "$CLI_DIR/tools" "$CLI_DIR/versions"
+
+    # Ensure every installed version folder has its own mods, resourcepacks, and shaderpacks directory inside it
+    # Also expose shortcuts in ~/minecraft-cli/versions/<version_name>/
+    if [ -d "$VERSIONS_DIR" ]; then
+        for v_dir in "$VERSIONS_DIR"/*; do
+            if [ -d "$v_dir" ]; then
+                local v_name
+                v_name=$(basename "$v_dir")
+                mkdir -p "$v_dir/mods" "$v_dir/resourcepacks" "$v_dir/shaderpacks" "$v_dir/saves" "$v_dir/config"
+
+                local cli_v_dir="$CLI_DIR/versions/$v_name"
+                mkdir -p "$cli_v_dir"
+                ln -sfn "$v_dir/mods" "$cli_v_dir/mods"
+                ln -sfn "$v_dir/resourcepacks" "$cli_v_dir/resourcepacks"
+                ln -sfn "$v_dir/shaderpacks" "$cli_v_dir/shaderpacks"
+                ln -sfn "$v_dir/saves" "$cli_v_dir/saves"
+                ln -sfn "$v_dir/config" "$cli_v_dir/config"
+            fi
+        done
+    fi
+
+    # Clean up stale versions in ~/minecraft-cli/versions/
+    if [ -d "$CLI_DIR/versions" ]; then
+        for cli_v in "$CLI_DIR/versions"/*; do
+            if [ -d "$cli_v" ]; then
+                local v_name
+                v_name=$(basename "$cli_v")
+                if [ ! -d "$VERSIONS_DIR/$v_name" ]; then
+                    rm -rf "$cli_v"
+                fi
+            fi
+        done
+    fi
+
+    local first_ver=""
+    if [ -d "$VERSIONS_DIR" ]; then
+        first_ver=$(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; 2>/dev/null | sort | head -n 1)
+    fi
+    if [ -n "$first_ver" ] && [ -d "$VERSIONS_DIR/$first_ver" ]; then
+        ln -sfn "$VERSIONS_DIR/$first_ver/mods" "$CLI_DIR/mods"
+        ln -sfn "$VERSIONS_DIR/$first_ver/resourcepacks" "$CLI_DIR/resourcepacks"
+        ln -sfn "$VERSIONS_DIR/$first_ver/shaderpacks" "$CLI_DIR/shaderpacks"
+    fi
 }
 sync_directories
-
-# ==========================================
-# PROGRESS BAR HELPER
-# ==========================================
-render_progress_bar() {
-    local current=$1
-    local total=$2
-    local label=${3:-"Progress"}
-    local width=30
-    if [ "$total" -le 0 ]; then return; fi
-    local percent=$(( 100 * current / total ))
-    local filled=$(( width * current / total ))
-    local empty=$(( width - filled ))
-    
-    local bar_fill=$(printf "%*s" "$filled" "" | tr ' ' '#')
-    local bar_empty=$(printf "%*s" "$empty" "" | tr ' ' '-')
-    
-    printf "\r\e[1;34m%-15s\e[0m \e[1;36m[%s%s]\e[0m \e[1;32m%3d%%\e[0m (\e[1;33m%d/%d\e[0m)" "$label" "$bar_fill" "$bar_empty" "$percent" "$current" "$total"
-}
 
 # ==========================================
 # CORE DOWNLOADER HELPER (VANILLA ENGINE)
@@ -102,25 +295,34 @@ download_vanilla_version() {
     curl -sL "$version_url" -o "$target_ver_json"
 
     echo -e "\e[1;34m==> [2/4] Downloading client binary ($target_ver.jar)...\e[0m"
-    local client_url
+    local client_url client_sz
     client_url=$(jq -r '.downloads.client.url' "$target_ver_json")
+    client_sz=$(jq -r '.downloads.client.size // 0' "$target_ver_json")
     local target_jar="$target_ver_dir/$target_ver.jar"
-    curl -sL "$client_url" -o "$target_jar"
+    download_single_file_with_progress "$client_url" "$target_jar" "Client Jar" "$client_sz"
 
     echo -e "\e[1;34m==> [3/4] Downloading version libraries...\e[0m"
-    mapfile -t libs_list < <(jq -r '.libraries[] | select(.downloads.artifact != null) | .downloads.artifact | "\(.path)|\(.url)"' "$target_ver_json")
+    mapfile -t libs_list < <(jq -r '.libraries[] | select(.downloads.artifact != null) | .downloads.artifact | "\(.path)|\(.url)|\(.size // 0)"' "$target_ver_json")
     local total_libs=${#libs_list[@]}
-    local curr_lib=0
+    local total_lib_bytes=0
     for item in "${libs_list[@]}"; do
-        local l_path="${item%%|*}"
-        local l_url="${item##*|}"
+        local sz="${item##*|}"
+        (( total_lib_bytes += sz ))
+    done
+
+    local curr_lib=0
+    local done_lib_bytes=0
+    local start_lib_ms=$(date +%s%3N 2>/dev/null || date +%s)
+    for item in "${libs_list[@]}"; do
+        IFS='|' read -r l_path l_url l_sz <<< "$item"
         local dest="$LIBS_DIR/$l_path"
         if [ ! -s "$dest" ]; then
             mkdir -p "$(dirname "$dest")"
             curl -sL "$l_url" -o "$dest"
         fi
         ((curr_lib++))
-        render_progress_bar "$curr_lib" "$total_libs" "Libraries"
+        ((done_lib_bytes += l_sz))
+        render_progress_bar "$curr_lib" "$total_libs" "Libraries" "$start_lib_ms" "$done_lib_bytes" "$total_lib_bytes"
     done
     echo ""
 
@@ -133,30 +335,52 @@ download_vanilla_version() {
     a_index_file="$ASSETS_DIR/indexes/$a_index_name.json"
 
     if [ ! -s "$a_index_file" ]; then
-        curl -sL "$a_index_url" -o "$a_index_file"
+        download_single_file_with_progress "$a_index_url" "$a_index_file" "Asset Index"
     fi
 
-    mapfile -t hash_list < <(jq -r '.objects | to_entries[] | .value.hash' "$a_index_file")
+    mapfile -t hash_size_list < <(jq -r '.objects | to_entries[] | "\(.value.hash):\(.value.size // 0)"' "$a_index_file")
     local missing_assets=()
-    for h in "${hash_list[@]}"; do
+    local total_asset_bytes=0
+    for item in "${hash_size_list[@]}"; do
+        local h="${item%%:*}"
+        local sz="${item##*:}"
         local pfx="${h:0:2}"
         if [ ! -s "$ASSETS_DIR/objects/$pfx/$h" ]; then
-            missing_assets+=("$h")
+            missing_assets+=("$h:$sz")
+            (( total_asset_bytes += sz ))
         fi
     done
 
     local total_missing=${#missing_assets[@]}
     if [ "$total_missing" -gt 0 ]; then
-        echo "  Downloading $total_missing missing assets in parallel..."
+        echo -e "\e[1;34m==> Downloading $total_missing missing assets in parallel (16 threads)...\e[0m"
         export ASSETS_DIR
-        dl_asset() {
-            local h="$1"
-            local p="${h:0:2}"
-            mkdir -p "$ASSETS_DIR/objects/$p"
-            curl -sL "https://resources.download.minecraft.net/$p/$h" -o "$ASSETS_DIR/objects/$p/$h"
-        }
-        export -f dl_asset
-        printf "%s\n" "${missing_assets[@]}" | xargs -n 1 -P 16 -I {} bash -c 'dl_asset "$@"' _ {}
+        local done_count=0
+        local done_bytes=0
+        local start_asset_ms=$(date +%s%3N 2>/dev/null || date +%s)
+        while read -r sz; do
+            sz=${sz:-0}
+            ((done_count++))
+            ((done_bytes += sz))
+            if (( done_count % 10 == 0 || done_count == total_missing )); then
+                render_progress_bar "$done_count" "$total_missing" "Assets" "$start_asset_ms" "$done_bytes" "$total_asset_bytes"
+            fi
+        done < <(printf "%s\n" "${missing_assets[@]}" | xargs -P 16 -n 25 bash -c '
+            for entry in "$@"; do
+                h="${entry%%:*}"
+                sz="${entry##*:}"
+                p="${h:0:2}"
+                dest="$ASSETS_DIR/objects/$p/$h"
+                if [ ! -s "$dest" ]; then
+                    mkdir -p "$ASSETS_DIR/objects/$p"
+                    curl -sL --retry 2 --retry-connrefused "https://resources.download.minecraft.net/$p/$h" -o "$dest"
+                fi
+                echo "$sz"
+            done
+        ' _)
+        echo ""
+    else
+        echo -e "  \e[1;32mAll assets are already verified and up-to-date.\e[0m"
     fi
 
     echo -e "\n\e[1;32m[+] Version $target_ver installed successfully in $target_ver_dir!\e[0m"
@@ -290,7 +514,7 @@ install_fabric_version() {
     echo -e "\n\e[1;34m==> Fetching Fabric Installer...\e[0m"
     local fabric_installer="$CLI_DIR/fabric-installer.jar"
     if [ ! -s "$fabric_installer" ]; then
-        curl -sL "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.0.1/fabric-installer-1.0.1.jar" -o "$fabric_installer"
+        download_single_file_with_progress "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.0.1/fabric-installer-1.0.1.jar" "$fabric_installer" "Fabric Inst."
     fi
 
     [ -f "$MC_DIR/launcher_profiles.json" ] || echo '{"profiles":{}}' > "$MC_DIR/launcher_profiles.json"
@@ -367,7 +591,7 @@ install_neoforge_version() {
     local tmp_installer="/tmp/neoforge-$target_neo_ver-installer.jar"
 
     echo -e "\e[1;34m==> Downloading NeoForge Installer...\e[0m"
-    curl -sL "$neo_installer_url" -o "$tmp_installer"
+    download_single_file_with_progress "$neo_installer_url" "$tmp_installer" "NeoForge Inst."
     if [ ! -s "$tmp_installer" ]; then
         echo -e "\e[1;31m[-] Failed to download NeoForge installer.\e[0m"
         rm -f "$tmp_installer"
@@ -437,7 +661,7 @@ install_forge_version() {
     local tmp_installer="/tmp/forge-$target_mc-$forge_ver-installer.jar"
 
     echo -e "\e[1;34m==> Downloading Forge Installer...\e[0m"
-    curl -sL "$forge_installer_url" -o "$tmp_installer"
+    download_single_file_with_progress "$forge_installer_url" "$tmp_installer" "Forge Inst."
     if [ ! -s "$tmp_installer" ]; then
         echo -e "\e[1;31m[-] Failed to download Forge installer.\e[0m"
         rm -f "$tmp_installer"
@@ -471,7 +695,7 @@ install_quilt_version() {
     local quilt_installer="$CLI_DIR/quilt-installer.jar"
     if [ ! -s "$quilt_installer" ]; then
         echo -e "\e[1;34m==> Downloading Quilt Installer...\e[0m"
-        curl -sL "https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-installer/0.11.0/quilt-installer-0.11.0.jar" -o "$quilt_installer"
+        download_single_file_with_progress "https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-installer/0.11.0/quilt-installer-0.11.0.jar" "$quilt_installer" "Quilt Inst."
     fi
 
     [ -f "$MC_DIR/launcher_profiles.json" ] || echo '{"profiles":{}}' > "$MC_DIR/launcher_profiles.json"
@@ -615,6 +839,9 @@ manage_offline_skins() {
                         jq --arg u "$u_name" --arg p "$dest" \
                             '.accounts = [((.accounts // [])[] | if (.username == $u and .type == "offline") then (.skin = $p) else . end)]' \
                             "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
+                        for inst_csl in "$VERSIONS_DIR"/*/CustomSkinLoader/LocalSkin/skins; do
+                            [ -d "$inst_csl" ] && cp "$dest" "$inst_csl/${u_name}.png" 2>/dev/null
+                        done
                         echo -e "\e[1;32m[+] Skin set successfully!\e[0m"
                     else
                         echo -e "\e[1;31m[-] Failed to load skin image.\e[0m"
@@ -637,6 +864,9 @@ manage_offline_skins() {
                         jq --arg u "$u_name" --arg p "$dest" \
                             '.accounts = [((.accounts // [])[] | if (.username == $u and .type == "offline") then (.cape = $p) else . end)]' \
                             "$ACCOUNTS_DB" > "$ACCOUNTS_DB.tmp" && mv "$ACCOUNTS_DB.tmp" "$ACCOUNTS_DB"
+                        for inst_csl in "$VERSIONS_DIR"/*/CustomSkinLoader/LocalSkin/capes; do
+                            [ -d "$inst_csl" ] && cp "$dest" "$inst_csl/${u_name}.png" 2>/dev/null
+                        done
                         echo -e "\e[1;32m[+] Cape set successfully!\e[0m"
                     else
                         echo -e "\e[1;31m[-] Failed to load cape image.\e[0m"
@@ -665,6 +895,9 @@ manage_offline_skins() {
                 ;;
             4)
                 rm -f "$SKINS_DIR/${u_name}.png" "$CAPES_DIR/${u_name}.png"
+                for inst_csl in "$VERSIONS_DIR"/*/CustomSkinLoader/LocalSkin; do
+                    [ -d "$inst_csl" ] && rm -f "$inst_csl/skins/${u_name}.png" "$inst_csl/capes/${u_name}.png" 2>/dev/null
+                done
                 ensure_accounts_db
                 jq --arg u "$u_name" \
                     '.accounts = [((.accounts // [])[] | if (.username == $u and .type == "offline") then (del(.skin) | del(.cape)) else . end)]' \
@@ -704,26 +937,28 @@ configure_settings() {
         case "$s_choice" in
             1)
                 echo -e "\nChoose Game Directory Location:"
-                echo -e "  [1] Standard ~/.minecraft"
-                echo -e "  [2] Inside minecraft-cli ($CLI_DIR/instances)"
+                echo -e "  [1] Standard ~/.minecraft ($HOME/.minecraft)"
+                echo -e "  [2] Inside launcher directory ($CLI_DIR/.minecraft)"
                 echo -e "  [3] Custom full path"
-                read -rp "Select [1-3]: " dir_choice
+                read -rp "Select [1-3, default: 1]: " dir_choice
                 case "$dir_choice" in
-                    1)
-                        jq --arg d "$HOME/.minecraft" '.game_dir = $d' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
-                        ;;
                     2)
-                        mkdir -p "$CLI_DIR/instances"
-                        jq --arg d "$CLI_DIR/instances" '.game_dir = $d' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+                        mkdir -p "$CLI_DIR/.minecraft"
+                        jq --arg d "$CLI_DIR/.minecraft" '.game_dir = $d' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
                         ;;
                     3)
-                        read -rp "Enter absolute folder path: " custom_dir
+                        read -rp "Enter directory path: " custom_dir
+                        custom_dir="${custom_dir/#\~/$HOME}"
                         if [ -n "$custom_dir" ]; then
                             mkdir -p "$custom_dir"
                             jq --arg d "$custom_dir" '.game_dir = $d' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
                         fi
                         ;;
+                    *)
+                        jq --arg d "$HOME/.minecraft" '.game_dir = $d' "$SETTINGS_FILE" > "$SETTINGS_FILE.tmp" && mv "$SETTINGS_FILE.tmp" "$SETTINGS_FILE"
+                        ;;
                 esac
+                sync_directories
                 ;;
             2)
                 read -rp "Enter Maximum RAM (e.g. 4G, 6G, 4096M): " new_max
@@ -876,6 +1111,90 @@ manage_accounts() {
     done
 }
 
+manage_mods_and_packs() {
+    while true; do
+        clear
+        echo -e "\e[1;35m==============================================\e[0m"
+        echo -e "\e[1;36m         MODS & RESOURCE PACKS MANAGER        \e[0m"
+        echo -e "\e[1;35m==============================================\e[0m"
+        echo -e "Each version has shortcut folders in: \e[1;33m$CLI_DIR/versions/<version>/\e[0m"
+        echo -e "  • mods/          (Place your mod .jar files here)"
+        echo -e "  • resourcepacks/ (Place texture/resource pack .zip files)"
+        echo -e "  • shaderpacks/   (Place shader .zip files)"
+        echo -e "\e[1;35m----------------------------------------------\e[0m"
+        echo -e "\e[1;33mInstalled Game Versions & Mod Counts:\e[0m"
+        for i in "${!INSTALLED_VERSIONS[@]}"; do
+            v_name="${INSTALLED_VERSIONS[$i]}"
+            v_mod_dir="$VERSIONS_DIR/$v_name/mods"
+            local count=0
+            if [ -d "$v_mod_dir" ]; then
+                count=$(find "$v_mod_dir" -maxdepth 1 -name "*.jar" 2>/dev/null | wc -l)
+            fi
+            printf "  \e[1;32m[%d]\e[0m %-30s (\e[1;34m%d mods\e[0m)\n" "$((i+1))" "$v_name" "$count"
+        done
+        echo -e "\e[1;35m----------------------------------------------\e[0m"
+        echo -e "  \e[1;32m[1-${#INSTALLED_VERSIONS[@]}]\e[0m Select version to manage mods / resource packs / shaders"
+        echo -e "  \e[1;36m[o]\e[0m Open main versions directory ($CLI_DIR/versions) in file manager"
+        echo -e "  \e[1;31m[b]\e[0m Back to Main Menu"
+        echo -e "\e[1;35m----------------------------------------------\e[0m"
+        read -rp "Select option: " mp_choice
+
+        if [ "$mp_choice" == "b" ] || [ "$mp_choice" == "B" ]; then
+            break
+        elif [ "$mp_choice" == "o" ] || [ "$mp_choice" == "O" ]; then
+            if command -v xdg-open >/dev/null 2>&1; then
+                xdg-open "$CLI_DIR/versions" >/dev/null 2>&1 &
+                echo -e "\e[1;32m[+] Opened $CLI_DIR/versions in file manager.\e[0m"
+                sleep 1
+            else
+                echo -e "Versions shortcut path: \e[1;32m$CLI_DIR/versions\e[0m"
+                read -rp "Press Enter to continue..."
+            fi
+        elif [[ "$mp_choice" =~ ^[0-9]+$ ]] && [ "$mp_choice" -ge 1 ] && [ "$mp_choice" -le "${#INSTALLED_VERSIONS[@]}" ]; then
+            local target_ver="${INSTALLED_VERSIONS[$((mp_choice-1))]}"
+            local target_mods="$VERSIONS_DIR/$target_ver/mods"
+            local target_rp="$VERSIONS_DIR/$target_ver/resourcepacks"
+            local target_sp="$VERSIONS_DIR/$target_ver/shaderpacks"
+            local cli_ver_dir="$CLI_DIR/versions/$target_ver"
+
+            mkdir -p "$target_mods" "$target_rp" "$target_sp"
+            ln -sfn "$target_mods" "$CLI_DIR/mods"
+            ln -sfn "$target_rp" "$CLI_DIR/resourcepacks"
+            ln -sfn "$target_sp" "$CLI_DIR/shaderpacks"
+
+            echo -e "\n\e[1;34m==> Version: $target_ver\e[0m"
+            echo -e "Version Shortcuts : \e[1;32m$cli_ver_dir\e[0m"
+            echo -e "Actual Mods Path  : \e[1;33m$target_mods\e[0m"
+            echo -e "\nInstalled Mods:"
+            local has_mods=false
+            for m in "$target_mods"/*; do
+                if [ -f "$m" ]; then
+                    echo -e "  • \e[1;32m$(basename "$m")\e[0m"
+                    has_mods=true
+                fi
+            done
+            [ "$has_mods" = false ] && echo -e "  \e[1;30m(No mods installed in this version folder yet)\e[0m"
+            echo ""
+
+            echo -e "Open folder in file manager:"
+            echo -e "  \e[1;32m[1]\e[0m Open Mods folder"
+            echo -e "  \e[1;32m[2]\e[0m Open Resource Packs folder"
+            echo -e "  \e[1;32m[3]\e[0m Open Shader Packs folder"
+            echo -e "  \e[1;32m[4]\e[0m Open Version Shortcut folder ($cli_ver_dir)"
+            echo -e "  \e[1;31m[b]\e[0m Back"
+            read -rp "Select option [1-4, or b]: " open_opt
+
+            case "$open_opt" in
+                1) command -v xdg-open >/dev/null 2>&1 && xdg-open "$target_mods" >/dev/null 2>&1 & ;;
+                2) command -v xdg-open >/dev/null 2>&1 && xdg-open "$target_rp" >/dev/null 2>&1 & ;;
+                3) command -v xdg-open >/dev/null 2>&1 && xdg-open "$target_sp" >/dev/null 2>&1 & ;;
+                4) command -v xdg-open >/dev/null 2>&1 && xdg-open "$cli_ver_dir" >/dev/null 2>&1 & ;;
+            esac
+            sleep 0.8
+        fi
+    done
+}
+
 # ==========================================
 # MAIN INTERACTIVE MENU
 # ==========================================
@@ -891,8 +1210,10 @@ while true; do
     echo -e "\e[1;35m==============================================\e[0m"
     echo -e "\e[1;36m             MINECRAFT CLI LAUNCHER           \e[0m"
     echo -e "\e[1;35m==============================================\e[0m"
-    printf "  \e[1;37mGame Path:\e[0m  \e[1;32m%s\e[0m\n" "$MC_DIR"
-    printf "  \e[1;37mRAM:\e[0m        -Xms\e[1;32m%s\e[0m / -Xmx\e[1;32m%s\e[0m\n" "$MIN_RAM" "$MAX_RAM"
+    printf "  \e[1;37mGame Path:\e[0m      \e[1;32m%s\e[0m\n" "$MC_DIR"
+    printf "  \e[1;37mVersions Dir:\e[0m   \e[1;32m%s\e[0m\n" "$CLI_DIR/versions"
+    printf "  \e[1;37mActive Mods:\e[0m    \e[1;32m%s\e[0m\n" "$CLI_DIR/mods"
+    printf "  \e[1;37mRAM:\e[0m            -Xms\e[1;32m%s\e[0m / -Xmx\e[1;32m%s\e[0m\n" "$MIN_RAM" "$MAX_RAM"
     echo -e "\e[1;35m----------------------------------------------\e[0m"
 
     echo -e "\e[1;33mInstalled Game Versions:\e[0m"
@@ -922,6 +1243,7 @@ while true; do
 
     echo -e "\n\e[1;33mCommands & Tools:\e[0m"
     echo -e "  \e[1;32m[i]\e[0m Install Version / Mod Loader (Vanilla, Fabric, NeoForge, Forge, Quilt)"
+    echo -e "  \e[1;35m[m]\e[0m Manage Mods & Resource Packs"
     echo -e "  \e[1;36m[s]\e[0m Offline Skins & Capes Manager"
     echo -e "  \e[1;33m[r]\e[0m Configure Directory, RAM & JVM Flags"
     echo -e "  \e[1;33m[u]\e[0m Manage Accounts (Authlib / Offline)"
@@ -932,6 +1254,9 @@ while true; do
     case "$main_choice" in
         i|I)
             install_new_version
+            ;;
+        m|M)
+            manage_mods_and_packs
             ;;
         s|S)
             manage_offline_skins
@@ -1048,14 +1373,18 @@ VERSION_JSON="$VERSIONS_DIR/$SELECTED_VERSION/$SELECTED_VERSION.json"
 MAIN_CLASS=$(jq -r '.mainClass' "$VERSION_JSON")
 INHERITS_FROM=$(jq -r '.inheritsFrom // empty' "$VERSION_JSON")
 
-INSTANCE_DIR="$VERSIONS_DIR/$SELECTED_VERSION"
-if [ -d "$INSTANCE_DIR/mods" ] || [ -d "$INSTANCE_DIR/resourcepacks" ]; then
-    ACTIVE_GAMEDIR="$INSTANCE_DIR"
-else
-    ACTIVE_GAMEDIR="$MC_DIR"
-fi
+ACTIVE_GAMEDIR="$VERSIONS_DIR/$SELECTED_VERSION"
+mkdir -p "$ACTIVE_GAMEDIR/mods" "$ACTIVE_GAMEDIR/resourcepacks" "$ACTIVE_GAMEDIR/shaderpacks" "$ACTIVE_GAMEDIR/saves" "$ACTIVE_GAMEDIR/config"
 
-mkdir -p "$ACTIVE_GAMEDIR/mods" "$ACTIVE_GAMEDIR/resourcepacks" "$ACTIVE_GAMEDIR/shaderpacks"
+# Update unhidden top-level symlinks in $CLI_DIR for easy access
+ln -sfn "$ACTIVE_GAMEDIR/mods" "$CLI_DIR/mods"
+ln -sfn "$ACTIVE_GAMEDIR/resourcepacks" "$CLI_DIR/resourcepacks"
+ln -sfn "$ACTIVE_GAMEDIR/shaderpacks" "$CLI_DIR/shaderpacks"
+
+# Copy existing saves if version saves folder is brand new
+if [ -d "$MC_DIR/saves" ] && [ -z "$(ls -A "$ACTIVE_GAMEDIR/saves" 2>/dev/null)" ]; then
+    cp -rn "$MC_DIR/saves"/* "$ACTIVE_GAMEDIR/saves/" 2>/dev/null
+fi
 
 CP_ENTRIES=()
 
@@ -1139,17 +1468,58 @@ if [ -n "$EXTRA_JVM" ]; then
     JVM_FLAGS+=("${EXTRA_FLAGS[@]}")
 fi
 
-# Authlib agent & Custom Skin Server handling (only attached if server is online)
+# Authlib agent & Offline Skins/Capes handling
 if [ "$SELECTED_TYPE" == "authlib" ] && [ -n "$SELECTED_SERVER" ]; then
     if [ "$SERVER_ONLINE" = true ]; then
-        JVM_FLAGS+=("-javaagent:$AUTHLIB_JAR=$SELECTED_SERVER")
+        JVM_FLAGS+=("-javaagent:$AUTHLIB_JAR=$SELECTED_SERVER" "-Dauthlibinjector.noLogFile")
     fi
 elif [ "$SELECTED_TYPE" == "offline" ]; then
     OFF_SKIN_SRV=$(echo "$SELECTED_RAW" | jq -r '.skin_server // empty')
     if [ -n "$OFF_SKIN_SRV" ]; then
         SKIN_SRV_STATUS=$(curl -sL --connect-timeout 3 --max-time 4 -o /dev/null -w "%{http_code}" "$OFF_SKIN_SRV")
         if [ "$SKIN_SRV_STATUS" -eq 200 ] || [ "$SKIN_SRV_STATUS" -eq 204 ]; then
-            JVM_FLAGS+=("-javaagent:$AUTHLIB_JAR=$OFF_SKIN_SRV")
+            JVM_FLAGS+=("-javaagent:$AUTHLIB_JAR=$OFF_SKIN_SRV" "-Dauthlibinjector.noLogFile")
+        fi
+    else
+        # Sync configured skin and cape paths to $SKINS_DIR and $CAPES_DIR if needed
+        STORED_SKIN=$(echo "$SELECTED_RAW" | jq -r '.skin // empty')
+        STORED_CAPE=$(echo "$SELECTED_RAW" | jq -r '.cape // empty')
+        [ -n "$STORED_SKIN" ] && [ -f "$STORED_SKIN" ] && [ "$STORED_SKIN" != "$SKINS_DIR/${SELECTED_USER}.png" ] && cp "$STORED_SKIN" "$SKINS_DIR/${SELECTED_USER}.png"
+        [ -n "$STORED_CAPE" ] && [ -f "$STORED_CAPE" ] && [ "$STORED_CAPE" != "$CAPES_DIR/${SELECTED_USER}.png" ] && cp "$STORED_CAPE" "$CAPES_DIR/${SELECTED_USER}.png"
+
+        USER_SKIN="$SKINS_DIR/${SELECTED_USER}.png"
+        USER_CAPE="$CAPES_DIR/${SELECTED_USER}.png"
+
+        # Prepare CustomSkinLoader mod for offline skins & capes
+        CSL_JAR="$CLI_DIR/tools/CustomSkinLoader_Universal-15.0.1.jar"
+        if [ -f "$CSL_JAR" ]; then
+            mkdir -p "$ACTIVE_GAMEDIR/mods"
+            cp -n "$CSL_JAR" "$ACTIVE_GAMEDIR/mods/" 2>/dev/null
+
+            CSL_DIR="$ACTIVE_GAMEDIR/CustomSkinLoader"
+            mkdir -p "$CSL_DIR/LocalSkin/skins" "$CSL_DIR/LocalSkin/capes"
+            cat > "$CSL_DIR/CustomSkinLoader.json" << 'CSL_EOF'
+{
+  "version": "15.0.1",
+  "enable": true,
+  "load_list": [
+    {
+      "name": "LocalSkin",
+      "type": "LocalSkin"
+    },
+    {
+      "name": "Mojang",
+      "type": "Mojang"
+    }
+  ]
+}
+CSL_EOF
+            if [ -s "$USER_SKIN" ]; then
+                cp "$USER_SKIN" "$CSL_DIR/LocalSkin/skins/${SELECTED_USER}.png" 2>/dev/null
+            fi
+            if [ -s "$USER_CAPE" ]; then
+                cp "$USER_CAPE" "$CSL_DIR/LocalSkin/capes/${SELECTED_USER}.png" 2>/dev/null
+            fi
         fi
     fi
 fi
@@ -1157,6 +1527,9 @@ fi
 # ==========================================
 # PARSE DYNAMIC JVM & GAME ARGUMENTS (NEOFORGE / FORGE / FABRIC / VANILLA)
 # ==========================================
+SELECTED_CLIENT_ID=$(echo "$SELECTED_RAW" | jq -r '.clientToken // empty' 2>/dev/null)
+[ -z "$SELECTED_CLIENT_ID" ] && SELECTED_CLIENT_ID="${SELECTED_UUID//-/}"
+
 substitute_vars() {
     local val="$1"
     val="${val//\$\{library_directory\}/$LIBS_DIR}"
@@ -1171,18 +1544,33 @@ substitute_vars() {
     val="${val//\$\{assets_index_name\}/$ASSET_INDEX}"
     val="${val//\$\{version_type\}/release}"
     val="${val//\$\{user_type\}/mojang}"
+    val="${val//\$\{launcher_name\}/minecraft-cli}"
+    val="${val//\$\{launcher_version\}/1.0.0}"
+    val="${val//\$\{clientid\}/$SELECTED_CLIENT_ID}"
+    val="${val//\$\{auth_xuid\}/0}"
+    val="${val//\$\{classpath\}/$FULL_CLASSPATH}"
     echo "$val"
 }
 
 extract_json_args() {
     local j_file="$1"
     local a_key="$2"
-    jq -r --arg k "$a_key" '
-      .[$k] // [] | .[] | 
+    local part1="${a_key%%.*}"
+    local part2="${a_key##*.}"
+    jq -r --arg p1 "$part1" --arg p2 "$part2" '
+      (.[$p1][$p2] // .[$p1] // []) | 
+      if type == "array" then .[] else . end |
       if type == "string" then . 
       elif type == "object" then
         if .value then
-          if ((.rules // []) | length == 0) or any(.rules[]; (.action == "allow" and ((.os.name // "linux") == "linux"))) then
+          if ((.rules // []) | length == 0) then
+            if (.value | type) == "array" then .value[] else .value end
+          elif any(.rules[]; 
+                 (.action == "allow" and 
+                  ((.os // null) == null or .os.name == "linux") and
+                  ((.features // null) == null)
+                 )
+               ) then
             if (.value | type) == "array" then .value[] else .value end
           else empty end
         else empty end
@@ -1194,8 +1582,10 @@ extract_json_args() {
 if [ -n "$INHERITS_FROM" ] && [ -f "$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.json" ]; then
     mapfile -t BASE_JVM_ARGS < <(extract_json_args "$VERSIONS_DIR/$INHERITS_FROM/$INHERITS_FROM.json" "arguments.jvm")
     for arg in "${BASE_JVM_ARGS[@]}"; do
+        [ -z "$arg" ] && continue
         [[ "$arg" == *java.library.path* ]] && continue
-        [[ "$arg" == *cp* ]] && continue
+        [[ "$arg" == "-cp" || "$arg" == "-classpath" || "$arg" == *classpath* ]] && continue
+        [[ "$arg" != -* ]] && continue
         expanded=$(substitute_vars "$arg")
         JVM_FLAGS+=("$expanded")
     done
@@ -1203,8 +1593,10 @@ fi
 
 mapfile -t VER_JVM_ARGS < <(extract_json_args "$VERSION_JSON" "arguments.jvm")
 for arg in "${VER_JVM_ARGS[@]}"; do
+    [ -z "$arg" ] && continue
     [[ "$arg" == *java.library.path* ]] && continue
-    [[ "$arg" == *cp* ]] && continue
+    [[ "$arg" == "-cp" || "$arg" == "-classpath" || "$arg" == *classpath* ]] && continue
+    [[ "$arg" != -* ]] && continue
     expanded=$(substitute_vars "$arg")
     JVM_FLAGS+=("$expanded")
 done

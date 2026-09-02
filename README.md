@@ -16,15 +16,14 @@ Built for terminal-centric Linux environments, this Bash utility automates versi
   - **Quilt Loader:** Seamless Quilt installer integration.
   - **Snapshots & Pre-releases:** Easy testing builds installation from Mojang manifests.
   - **Dynamic Badges in Version List:** Clearly labels installed versions as `(Vanilla)`, `(Fabric)`, `(NeoForge)`, `(Forge)`, `(Quilt)`, `(OptiFine)`, or `(Snapshot)`.
-- **Offline Skins & Capes Manager (`[s]`):**
-  - **Skin & Cape Management:** Configure custom `.png` image files or direct image URLs for offline player profiles.
-  - **Custom Skin / Auth Server:** Attach custom Yggdrasil / authlib endpoints to offline sessions.
-- **Custom Authlib / Yggdrasil Support:** Native integration with `authlib-injector` to authenticate against third-party servers (e.g. custom endpoints, Blessing Skin).
+- **Offline Skins & Capes via Mod:** Automatically provisions the universal `CustomSkinLoader` mod into your instance `mods/` directory, loading local `.png` skins and capes in-game with zero Python scripts and zero external services.
+- **Per-Version Instance Isolation:** Each game version runs from its own clean, isolated directory (`~/minecraft-cli/instances/<version>/`) so worlds, settings, and mods never conflict between versions.
+- **Convenient Top-Level Folders:** Unhidden `~/minecraft-cli/mods` and `~/minecraft-cli/resourcepacks` folders symlink directly to your active instance for effortless drag-and-drop.
+- **Mods & Resource Packs Manager (`[m]`):** View installed mods and quickly launch your system file manager to drop in new mods.
+- **Custom Authlib / Yggdrasil Support:** Native integration with `authlib-injector` to authenticate against third-party servers.
 - **Session Auto-Refresh:** Automatically validates and refreshes session tokens before game launch.
 - **Multi-Account Manager:** Save multiple user profiles (both Authlib and Offline) and switch between them effortlessly.
 - **Built-in Fast Version Downloader:** Multi-threaded parallel asset downloads (`xargs -P 16`), library resolution, and Linux native extraction.
-- **Per-Version Instance Isolation:** If a version folder contains its own `mods/` or `resourcepacks/` directory, the launcher automatically isolates the game directory to that specific version.
-- **Flexible Game Directory:** Run Minecraft from the standard `~/.minecraft` path, an isolated directory inside `~/minecraft-cli/instances`, or any custom directory.
 - **Interactive TUI Configuration:** Adjust maximum RAM (`-Xmx`), minimum RAM (`-Xms`), and JVM flags directly from the terminal.
 
 ---
@@ -87,23 +86,48 @@ Launch the interactive interface:
 ./launch.sh
 ```
 
+### First-Time Run Setup
+On your first launch, the launcher will ask you where you want to store your game files:
+```text
+==============================================
+         WELCOME TO MINECRAFT LAUNCHER        
+==============================================
+  Please select the directory where you want to
+  install and store your Minecraft game files:
+
+  [1] Standard ~/.minecraft
+      (Default location: ~/.minecraft)
+
+  [2] Inside Launcher Directory
+      (Location: ~/minecraft-cli/.minecraft)
+
+  [3] Custom Path
+      (Specify any folder on your system)
+----------------------------------------------
+Select an option [1-3, default: 1]: 
+```
+Your choice is remembered in `settings.json`. You can reconfigure this at any time using option `[r]`.
+
 ### Main Menu Overview
 
 ```text
 ==============================================
              MINECRAFT CLI LAUNCHER           
 ==============================================
-  Game Path:  /home/username/.minecraft
-  RAM:        -Xms2G / -Xmx4G
+  Game Path:      /home/username/.minecraft
+  Versions Dir:   /home/username/.minecraft/versions
+  Active Mods:    ~/minecraft-cli/mods
+  RAM:            -Xms2G / -Xmx4G
 ----------------------------------------------
 Installed Game Versions:
-  [1] 1.21.1                         (Vanilla)
-  [2] fabric-loader-0.16.9-1.21.1    (Fabric)
-  [3] neoforge-21.1.249              (NeoForge)
-  [4] 1.20.1-forge-47.4.10           (Forge)
+  [1] 1.21.11                        (Vanilla)
+  [2] 26.2                           (Vanilla)
+  [3] fabric-loader-0.19.3-1.21.11   (Fabric)
+  [4] fabric-loader-0.19.3-26.2      (Fabric)
 
 Commands & Tools:
   [i] Install Version / Mod Loader (Vanilla, Fabric, NeoForge, Forge, Quilt)
+  [m] Manage Mods & Resource Packs
   [s] Offline Skins & Capes Manager
   [r] Configure Directory, RAM & JVM Flags
   [u] Manage Accounts (Authlib / Offline)
@@ -161,6 +185,12 @@ Manage custom skins, capes, and custom authlib skin servers for offline profiles
 - **Option [4] Clear Skin & Cape:**
   - Resets custom skin and cape textures for the profile.
 
+### How Offline Skins & Capes Work
+Offline player skins and capes are loaded directly into the game using the universal **CustomSkinLoader** mod (`tools/CustomSkinLoader_Universal-15.0.1.jar`).
+- **No Python scripts** running in the background.
+- **No third-party network services** (like `ely.by`) — textures are loaded from local folders.
+- Automatically configured for any modded loader (Fabric, Forge, NeoForge, Quilt).
+
 ---
 
 ## Configuration & Storage Layout
@@ -168,20 +198,44 @@ Manage custom skins, capes, and custom authlib skin servers for offline profiles
 ```text
 ~/minecraft-cli/
 ├── launch.sh              # Main executable launcher script
-├── settings.json          # RAM limits, JVM flags, and game directory settings
+├── settings.json          # RAM limits, game directory and JVM configuration
+├── versions/              # Direct shortcuts to every installed version
+│   ├── fabric-loader-0.19.5-1.21/
+│   │   ├── mods/          # Shortcut to version's mods folder
+│   │   ├── resourcepacks/ # Shortcut to version's resourcepacks
+│   │   ├── shaderpacks/   # Shortcut to version's shaderpacks
+│   │   └── saves/         # Shortcut to version's saves
+│   └── 1.21/
+│       ├── mods/
+│       ├── resourcepacks/
+│       └── shaderpacks/
+├── mods/                  # Quick shortcut symlink to active version's mods directory
+├── resourcepacks/         # Quick shortcut symlink to active version's resourcepacks
+├── shaderpacks/           # Quick shortcut symlink to active version's shaderpacks
+├── .minecraft/
+│   └── versions/
+│       ├── fabric-loader-0.19.5-1.21/
+│       │   ├── mods/            # Dedicated mods folder for this version
+│       │   ├── resourcepacks/   # Dedicated resourcepacks for this version
+│       │   ├── shaderpacks/     # Dedicated shaderpacks for this version
+│       │   ├── saves/           # Singleplayer worlds for this version
+│       │   ├── CustomSkinLoader/# Offline skins & capes cache for this version
+│       │   ├── fabric-loader-0.19.5-1.21.jar
+│       │   └── fabric-loader-0.19.5-1.21.json
+├── tools/
+│   └── CustomSkinLoader_Universal-15.0.1.jar # Universal mod for offline skins
 ├── authlib/
-│   ├── authlib-injector.jar # Auto-downloaded agent for custom auth & skin servers
-│   └── accounts.json      # Stored session profiles and tokens
-├── skins/                 # Cached local offline skin images
-├── capes/                 # Cached local offline cape images
-└── instances/             # Optional isolated game directory
+│   ├── authlib-injector.jar # Agent for third-party Yggdrasil authentication
+│   └── accounts.json      # Stored session profiles and offline accounts
+├── skins/                 # Stored player skin PNGs
+└── capes/                 # Stored player cape PNGs
 ```
 
 ### `settings.json` Example
 
 ```json
 {
-  "game_dir": "/home/username/.minecraft",
+  "game_dir": "/home/username/minecraft-cli/.minecraft",
   "max_ram": "4G",
   "min_ram": "2G",
   "jvm_args": "-XX:+UnlockExperimentalVMOptions -XX:+UseG1GC -XX:G1NewSizePercent=20 -XX:G1ReservePercent=20 -XX:MaxGCPauseMillis=50 -XX:G1HeapRegionSize=32M --enable-native-access=ALL-UNNAMED"
@@ -192,10 +246,12 @@ Manage custom skins, capes, and custom authlib skin servers for offline profiles
 
 ## Modding & Directory Isolation
 
-- **Per-Version Isolation:**
-  If `<game_dir>/versions/<version-name>/mods/` or `resourcepacks/` exists, `minecraft-cli` will automatically isolate the game directory to that version's folder.
-- **Global Mod Directory:**
-  Otherwise, mods are loaded from `<game_dir>/mods/` and shaderpacks from `<game_dir>/shaderpacks/`.
+- **Direct In-Version Isolation:**
+  Every version has its own dedicated `mods/`, `resourcepacks/`, `shaderpacks/`, and `saves/` folders directly inside `.minecraft/versions/<version>/`.
+- **Active Version Symlinks:**
+  The root `~/minecraft-cli/mods` and `~/minecraft-cli/resourcepacks` folders point directly to your selected version's folder so you can easily access them from your file manager or terminal.
+- **Manage Mods in Launcher (`[m]`):**
+  Select `[m]` in the main launcher menu to review installed mods for each version and open any version's `mods/` folder in your system file manager.
 
 ---
 

@@ -4,6 +4,13 @@ instances/
 .minecraft/
 skins/
 capes/
+mods
+resourcepacks
+shaderpacks
+saves
+tools/
+logs/
 *.log
 *.jar
 errors.txt
+versions/
